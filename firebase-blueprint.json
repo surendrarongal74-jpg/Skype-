@@ -1,0 +1,728 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User travel preferences and ALLORA assistant settings",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Firebase Auth UID" },
+        "displayName": { "type": "string", "description": "Display name" },
+        "preferredCurrency": { "type": "string", "description": "ISO currency code" },
+        "temperatureUnit": { "type": "string", "enum": ["METRIC", "IMPERIAL"] },
+        "preferredCabinClass": { "type": "string", "enum": ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"] },
+        "homeAirportIata": { "type": "string", "description": "Home airport IATA code" },
+        "travelStyle": { "type": "string", "description": "Preferred travel style" },
+        "budgetTier": { "type": "string", "description": "Default budget preference" },
+        "biometricThresholdUsd": { "type": "number", "description": "Approval threshold in USD" },
+        "darkGlassTheme": { "type": "boolean", "description": "Dark glass theme toggle" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp" }
+      },
+      "required": [
+        "userId",
+        "displayName",
+        "preferredCurrency",
+        "temperatureUnit",
+        "preferredCabinClass",
+        "homeAirportIata",
+        "biometricThresholdUsd",
+        "darkGlassTheme",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TripPlan": {
+      "title": "TripPlan",
+      "description": "User planned or AI-generated trip overview",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "destination": { "type": "string" },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" },
+        "travellersCount": { "type": "integer" },
+        "budgetUsd": { "type": "number" },
+        "style": { "type": "string" },
+        "status": { "type": "string", "enum": ["PLANNED", "UPCOMING", "COMPLETED"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "title",
+        "destination",
+        "startDate",
+        "endDate",
+        "travellersCount",
+        "budgetUsd",
+        "style",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BookingDoc": {
+      "title": "BookingDoc",
+      "description": "User booking hold or confirmed reservation record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "referenceCode": { "type": "string" },
+        "bookingType": { "type": "string", "enum": ["FLIGHT", "HOTEL", "CAR_RENTAL", "DINING", "ACTIVITY"] },
+        "title": { "type": "string" },
+        "providerSource": { "type": "string" },
+        "providerPnr": { "type": "string" },
+        "originOrLocation": { "type": "string" },
+        "destination": { "type": "string" },
+        "totalAmountUsd": { "type": "number" },
+        "status": { "type": "string", "enum": ["REQUESTED", "HELD", "USER_APPROVED", "CONFIRMED", "CANCELLED", "NOT_BOOKABLE"] },
+        "sha256AuditHash": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "referenceCode",
+        "bookingType",
+        "title",
+        "providerSource",
+        "originOrLocation",
+        "totalAmountUsd",
+        "status",
+        "sha256AuditHash",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ItinerarySlotDoc": {
+      "title": "ItinerarySlotDoc",
+      "description": "Persisted itinerary stop belonging to a specific user trip",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "tripId": { "type": "string" },
+        "dayNumber": { "type": "integer" },
+        "timeRange": { "type": "string" },
+        "title": { "type": "string" },
+        "location": { "type": "string" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "category": { "type": "string" },
+        "durationMinutes": { "type": "integer" },
+        "routeSequence": { "type": "integer" },
+        "notes": { "type": "string" },
+        "estimatedCostUsd": { "type": "number" },
+        "calSyncStatus": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "tripId",
+        "dayNumber",
+        "timeRange",
+        "title",
+        "location",
+        "category",
+        "durationMinutes",
+        "routeSequence",
+        "notes",
+        "estimatedCostUsd",
+        "calSyncStatus",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AiMessageDoc": {
+      "title": "AiMessageDoc",
+      "description": "Persisted ALLORA AI conversation message with optional tool summary",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "isUser": { "type": "boolean" },
+        "text": { "type": "string" },
+        "toolTraceSummary": { "type": "string" },
+        "isError": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "isUser",
+        "text",
+        "isError",
+        "createdAt"
+      ]
+    },
+    "SavedItemDoc": {
+      "title": "SavedItemDoc",
+      "description": "Saved travel destination, flight, hotel, attraction, or itinerary",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "itemType": { "type": "string", "enum": ["DESTINATION", "HOTEL", "FLIGHT", "ATTRACTION", "ITINERARY"] },
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "category": { "type": "string" },
+        "priceLabel": { "type": "string" },
+        "rating": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "itemType",
+        "title",
+        "subtitle",
+        "category",
+        "priceLabel",
+        "rating",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AutonomousTaskDoc": {
+      "title": "AutonomousTaskDoc",
+      "description": "User autonomous multi-step AI task plan, checkpoint state, logs, and verified outcome",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "executionId": { "type": "string" },
+        "projectId": { "type": "string" },
+        "title": { "type": "string" },
+        "goal": { "type": "string" },
+        "understandingSummary": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["RECEIVED", "UNDERSTANDING", "PLANNING", "AWAITING_INPUT", "RUNNING", "EXECUTING", "VERIFYING", "PAUSED", "WAITING_FOR_APPROVAL", "WAITING_FOR_PERMISSION", "COMPLETED", "FAILED", "CANCELLED"]
+        },
+        "totalSteps": { "type": "integer" },
+        "completedSteps": { "type": "integer" },
+        "checkpointJson": { "type": "string" },
+        "finalOutcome": { "type": "string" },
+        "reportMarkdown": { "type": "string" },
+        "errorSummary": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "title",
+        "goal",
+        "understandingSummary",
+        "status",
+        "totalSteps",
+        "completedSteps",
+        "checkpointJson",
+        "finalOutcome",
+        "reportMarkdown",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WorkspaceNoteDoc": {
+      "title": "WorkspaceNoteDoc",
+      "description": "User-saved internal note, task list, or autonomous research comparison report",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "taskId": { "type": "string" },
+        "noteType": { "type": "string", "enum": ["NOTE", "TASK_LIST", "RESEARCH_REPORT"] },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "tagsCsv": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "noteType",
+        "title",
+        "content",
+        "tagsCsv",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WalletAccountDoc": {
+      "title": "WalletAccountDoc",
+      "description": "User-scoped tokenized wallet metadata reconciled with regulated payment provider records",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "currency": { "type": "string" },
+        "verifiedBalanceMinor": { "type": "integer" },
+        "pendingBalanceMinor": { "type": "integer" },
+        "perTxLimitMinor": { "type": "integer" },
+        "dailyLimitMinor": { "type": "integer" },
+        "monthlyLimitMinor": { "type": "integer" },
+        "dailySpentMinor": { "type": "integer" },
+        "monthlySpentMinor": { "type": "integer" },
+        "emergencyLocked": { "type": "boolean" },
+        "isMinorAccount": { "type": "boolean" },
+        "guardianApproved": { "type": "boolean" },
+        "guardianEmail": { "type": "string" },
+        "providerName": { "type": "string" },
+        "providerAccountRef": { "type": "string" },
+        "reconciliationStatus": { "type": "string", "enum": ["UNCONFIGURED", "RECONCILED", "MISMATCH", "SYNC_PENDING"] },
+        "reconciliationSha256": { "type": "string" },
+        "lastReconciledAtMs": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "currency",
+        "verifiedBalanceMinor",
+        "pendingBalanceMinor",
+        "perTxLimitMinor",
+        "dailyLimitMinor",
+        "monthlyLimitMinor",
+        "dailySpentMinor",
+        "monthlySpentMinor",
+        "emergencyLocked",
+        "isMinorAccount",
+        "guardianApproved",
+        "providerName",
+        "reconciliationStatus",
+        "reconciliationSha256",
+        "lastReconciledAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WalletTransactionDoc": {
+      "title": "WalletTransactionDoc",
+      "description": "Immutable user-scoped wallet transaction ledger & receipt record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "txType": { "type": "string", "enum": ["DEPOSIT", "WITHDRAWAL", "PURCHASE", "REFUND", "HOLD"] },
+        "status": { "type": "string", "enum": ["PENDING", "AUTHORIZED", "SUCCEEDED", "FAILED", "REFUNDED", "CANCELLED"] },
+        "idempotencyKey": { "type": "string" },
+        "providerTransactionId": { "type": "string" },
+        "providerVerificationStatus": { "type": "string", "enum": ["UNVERIFIED", "VERIFIED", "MISMATCH", "PROVIDER_NOT_CONFIGURED"] },
+        "merchant": { "type": "string" },
+        "productTitle": { "type": "string" },
+        "deliveryOrBookingDetails": { "type": "string" },
+        "subtotalMinor": { "type": "integer" },
+        "taxesAndFeesMinor": { "type": "integer" },
+        "totalMinor": { "type": "integer" },
+        "balanceBeforeMinor": { "type": "integer" },
+        "balanceAfterMinor": { "type": "integer" },
+        "refundedMinor": { "type": "integer" },
+        "receiptSha256": { "type": "string" },
+        "ownerAuthorized": { "type": "boolean" },
+        "failureReason": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "txType",
+        "status",
+        "idempotencyKey",
+        "providerVerificationStatus",
+        "merchant",
+        "productTitle",
+        "deliveryOrBookingDetails",
+        "subtotalMinor",
+        "taxesAndFeesMinor",
+        "totalMinor",
+        "balanceBeforeMinor",
+        "balanceAfterMinor",
+        "refundedMinor",
+        "receiptSha256",
+        "ownerAuthorized",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PermissionPolicyDoc": {
+      "title": "PermissionPolicyDoc",
+      "description": "Owner Permission Center policy per Firebase user",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "walletAccess": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "purchasePermission": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "emailRead": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "emailSend": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "browserAccess": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "websiteLogin": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "fileAccess": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "bookingPermission": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "autonomousTaskPermission": { "type": "string", "enum": ["ALWAYS_ASK", "LIMITED_AUTONOMY", "MANUAL_APPROVAL_REQUIRED"] },
+        "maxTxAmountMinor": { "type": "integer" },
+        "killSwitchActive": { "type": "boolean" },
+        "revokedDomainsCsv": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "walletAccess",
+        "purchasePermission",
+        "emailRead",
+        "emailSend",
+        "browserAccess",
+        "websiteLogin",
+        "fileAccess",
+        "bookingPermission",
+        "autonomousTaskPermission",
+        "maxTxAmountMinor",
+        "killSwitchActive",
+        "revokedDomainsCsv",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "EmailConnectionDoc": {
+      "title": "EmailConnectionDoc",
+      "description": "User email identity & OAuth connection metadata (zero passwords or OAuth secrets stored)",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "connectedEmail": { "type": "string" },
+        "alloraAlias": { "type": "string" },
+        "mailboxProvisioned": { "type": "boolean" },
+        "connectionStatus": { "type": "string", "enum": ["DISCONNECTED", "OAUTH_CONNECTED", "PROVISIONED_MAILBOX"] },
+        "grantedScopesCsv": { "type": "string" },
+        "allowNarrowAutoSend": { "type": "boolean" },
+        "allowedAutoSendRecipientsCsv": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "connectedEmail",
+        "alloraAlias",
+        "mailboxProvisioned",
+        "connectionStatus",
+        "grantedScopesCsv",
+        "allowNarrowAutoSend",
+        "allowedAutoSendRecipientsCsv",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "EmailItemDoc": {
+      "title": "EmailItemDoc",
+      "description": "User-scoped email draft, summary, receipt, or tracked email metadata",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "itemKind": { "type": "string", "enum": ["INBOX_SUMMARY", "DRAFT", "SENT_LOG", "RECEIPT"] },
+        "providerMessageId": { "type": "string" },
+        "recipient": { "type": "string" },
+        "sender": { "type": "string" },
+        "subject": { "type": "string" },
+        "snippet": { "type": "string" },
+        "aiSummary": { "type": "string" },
+        "status": { "type": "string", "enum": ["SYNCED", "DRAFT", "AWAITING_APPROVAL", "SENT", "FAILED"] },
+        "isImportant": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId",
+        "itemKind",
+        "recipient",
+        "sender",
+        "subject",
+        "snippet",
+        "aiSummary",
+        "status",
+        "isImportant",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BrowserTabDoc": {
+      "title": "BrowserTabDoc",
+      "description": "Per-user isolated browser tab state",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "url": { "type": "string" },
+        "title": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "isAutomationActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "url", "title", "isActive", "isAutomationActive", "createdAt", "updatedAt"]
+    },
+    "BrowserRecordDoc": {
+      "title": "BrowserRecordDoc",
+      "description": "Per-user isolated browser history, bookmarks, downloads, permissions, or connected domain sessions",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "recordType": { "type": "string", "enum": ["HISTORY", "BOOKMARK", "DOWNLOAD", "SITE_PERMISSION", "SESSION"] },
+        "domain": { "type": "string" },
+        "url": { "type": "string" },
+        "title": { "type": "string" },
+        "permissionMode": { "type": "string" },
+        "filePath": { "type": "string" },
+        "status": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "recordType", "domain", "url", "title", "permissionMode", "status", "createdAt", "updatedAt"]
+    },
+    "WorkspaceFileDoc": {
+      "title": "WorkspaceFileDoc",
+      "description": "Per-user isolated file index",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "fileName": { "type": "string" },
+        "mimeType": { "type": "string" },
+        "sizeBytes": { "type": "integer" },
+        "relativePath": { "type": "string" },
+        "source": { "type": "string" },
+        "sha256": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "fileName", "mimeType", "sizeBytes", "relativePath", "source", "sha256", "createdAt"]
+    },
+    "SecurityAuditLogDoc": {
+      "title": "SecurityAuditLogDoc",
+      "description": "Append-only sanitized security audit log per user",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "category": { "type": "string", "enum": ["AUTH", "WALLET", "PAYMENT", "EMAIL", "BROWSER", "PERMISSION", "TASK", "ISOLATION"] },
+        "action": { "type": "string" },
+        "outcome": { "type": "string", "enum": ["ALLOWED", "DENIED", "BLOCKED", "VERIFIED", "FAILED", "REVOKED"] },
+        "detail": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "category", "action", "outcome", "detail", "createdAt"]
+    },
+    "NotificationDoc": {
+      "title": "NotificationDoc",
+      "description": "User-scoped real-time ALLORA notification record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "category": { "type": "string" },
+        "actionRoute": { "type": "string" },
+        "isUnread": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "message", "category", "isUnread", "createdAt", "updatedAt"]
+    },
+    "AiPreferencesDoc": {
+      "title": "AiPreferencesDoc",
+      "description": "User AI model selection mode, preferred model, manual model, and failover preferences",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "selectionMode": { "type": "string", "enum": ["AUTOMATIC", "PREFERRED_MODEL", "MANUAL_MODE"] },
+        "preferredModelId": { "type": "string" },
+        "manualModelId": { "type": "string" },
+        "autoSwitchOnFailure": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "selectionMode", "preferredModelId", "manualModelId", "autoSwitchOnFailure", "updatedAt"]
+    },
+    "AiFailoverLogDoc": {
+      "title": "AiFailoverLogDoc",
+      "description": "Append-only sanitized telemetry log recording automatic AI model failover events",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "requestId": { "type": "string" },
+        "taskProfile": { "type": "string" },
+        "fromModelId": { "type": "string" },
+        "toModelId": { "type": "string" },
+        "reasonCategory": { "type": "string" },
+        "statusCode": { "type": "integer" },
+        "detail": { "type": "string" },
+        "delayMs": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "requestId", "taskProfile", "fromModelId", "toModelId", "reasonCategory", "statusCode", "detail", "delayMs", "createdAt"]
+    },
+    "AiModelConfigDoc": {
+      "title": "AiModelConfigDoc",
+      "description": "Remote AI model catalog entry without API keys or secrets",
+      "type": "object",
+      "properties": {
+        "modelId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "providerType": { "type": "string" },
+        "providerModelName": { "type": "string" },
+        "tier": { "type": "string" },
+        "priority": { "type": "integer" },
+        "enabled": { "type": "boolean" },
+        "timeoutMs": { "type": "integer" },
+        "contextWindowTokens": { "type": "integer" },
+        "costPer1kInputUsd": { "type": "number" },
+        "costPer1kOutputUsd": { "type": "number" },
+        "capabilitiesCsv": { "type": "string" },
+        "speedRating": { "type": "string" }
+      },
+      "required": ["modelId", "displayName", "providerType", "providerModelName", "priority", "enabled"]
+    },
+    "MemoryEntryDoc": {
+      "title": "MemoryEntryDoc",
+      "description": "User-controlled ALLORA Memory entry with category, approval, and retention window",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "category": { "type": "string", "enum": ["USER_PREFERENCES", "CONVERSATION_SUMMARIES", "PROJECT_CONTEXT", "USER_FACTS", "ACTIVE_TASKS", "FREQUENT_TOOLS"] },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "source": { "type": "string" },
+        "userApproved": { "type": "boolean" },
+        "retentionDays": { "type": "integer" },
+        "expiresAt": { "type": "integer" },
+        "usageCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "category", "title", "content", "source", "userApproved", "retentionDays", "expiresAt", "usageCount", "createdAt", "updatedAt"]
+    },
+    "ProjectDoc": {
+      "title": "ProjectDoc",
+      "description": "ALLORA workspace project linking tasks, files, and conversation threads",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "PAUSED", "COMPLETED", "ARCHIVED"] },
+        "progressPercent": { "type": "integer" },
+        "linkedTaskIdsCsv": { "type": "string" },
+        "linkedFileIdsCsv": { "type": "string" },
+        "linkedThreadId": { "type": "string" },
+        "tagsCsv": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "description", "status", "progressPercent", "linkedTaskIdsCsv", "linkedFileIdsCsv", "tagsCsv", "createdAt", "updatedAt"]
+    },
+    "PersonalityProfileDoc": {
+      "title": "PersonalityProfileDoc",
+      "description": "User configurable ALLORA personality profile decoupled from execution permissions",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "presetMode": { "type": "string", "enum": ["BALANCED_COMPANION", "EXECUTIVE_AGENT", "WARM_COMPANION", "FUTURISTIC_OS"] },
+        "warmthLevel": { "type": "integer" },
+        "concisenessLevel": { "type": "integer" },
+        "proactivityLevel": { "type": "integer" },
+        "explanationTransparency": { "type": "boolean" },
+        "voiceConsistencyEnabled": { "type": "boolean" },
+        "customSignatureNote": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "presetMode", "warmthLevel", "concisenessLevel", "proactivityLevel", "explanationTransparency", "voiceConsistencyEnabled", "customSignatureNote", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Per-user ALLORA profile and travel preferences"
+    },
+    "/users/{userId}/trips/{tripId}": {
+      "schema": { "$ref": "#/entities/TripPlan" },
+      "description": "User travel plans and AI itineraries"
+    },
+    "/users/{userId}/trips/{tripId}/itinerary_slots/{slotId}": {
+      "schema": { "$ref": "#/entities/ItinerarySlotDoc" },
+      "description": "Persisted itinerary stops scoped to a specific trip"
+    },
+    "/users/{userId}/bookings/{bookingId}": {
+      "schema": { "$ref": "#/entities/BookingDoc" },
+      "description": "User booking holds, approvals, and confirmed PNR records"
+    },
+    "/users/{userId}/saved_items/{itemId}": {
+      "schema": { "$ref": "#/entities/SavedItemDoc" },
+      "description": "User bookmarked destinations, hotels, flights, and attractions"
+    },
+    "/users/{userId}/ai_messages/{msgId}": {
+      "schema": { "$ref": "#/entities/AiMessageDoc" },
+      "description": "Persisted AI assistant conversation messages"
+    },
+    "/users/{userId}/autonomous_tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/AutonomousTaskDoc" },
+      "description": "User autonomous multi-step AI tasks, checkpoints, and reports"
+    },
+    "/users/{userId}/workspace_notes/{noteId}": {
+      "schema": { "$ref": "#/entities/WorkspaceNoteDoc" },
+      "description": "User notes, task lists, and research reports generated in ALLORA"
+    },
+    "/users/{userId}/wallet_accounts/{accountId}": {
+      "schema": { "$ref": "#/entities/WalletAccountDoc" },
+      "description": "Per-user ALLORA wallet account reconciled with payment provider"
+    },
+    "/users/{userId}/wallet_transactions/{txId}": {
+      "schema": { "$ref": "#/entities/WalletTransactionDoc" },
+      "description": "Per-user immutable wallet transactions and receipts"
+    },
+    "/users/{userId}/permission_policies/{policyId}": {
+      "schema": { "$ref": "#/entities/PermissionPolicyDoc" },
+      "description": "Per-user Owner Permission Center policy"
+    },
+    "/users/{userId}/email_connections/{connId}": {
+      "schema": { "$ref": "#/entities/EmailConnectionDoc" },
+      "description": "Per-user Email OAuth connection metadata and identity"
+    },
+    "/users/{userId}/email_items/{itemId}": {
+      "schema": { "$ref": "#/entities/EmailItemDoc" },
+      "description": "Per-user Email summaries, drafts, receipts, and sent records"
+    },
+    "/users/{userId}/browser_tabs/{tabId}": {
+      "schema": { "$ref": "#/entities/BrowserTabDoc" },
+      "description": "Per-user isolated browser tabs"
+    },
+    "/users/{userId}/browser_records/{recordId}": {
+      "schema": { "$ref": "#/entities/BrowserRecordDoc" },
+      "description": "Per-user browser history, bookmarks, downloads, site permissions, and sessions"
+    },
+    "/users/{userId}/workspace_files/{fileId}": {
+      "schema": { "$ref": "#/entities/WorkspaceFileDoc" },
+      "description": "Per-user isolated file metadata"
+    },
+    "/users/{userId}/security_audit/{logId}": {
+      "schema": { "$ref": "#/entities/SecurityAuditLogDoc" },
+      "description": "Per-user append-only security audit logs"
+    },
+    "/users/{userId}/notifications/{notifId}": {
+      "schema": { "$ref": "#/entities/NotificationDoc" },
+      "description": "Per-user activity and alert notifications"
+    },
+    "/users/{userId}/ai_preferences/{prefId}": {
+      "schema": { "$ref": "#/entities/AiPreferencesDoc" },
+      "description": "Per-user AI orchestration selection mode and preferred model settings"
+    },
+    "/users/{userId}/ai_failover_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AiFailoverLogDoc" },
+      "description": "Per-user append-only sanitized AI failover telemetry logs"
+    },
+    "/ai_model_configs/{modelId}": {
+      "schema": { "$ref": "#/entities/AiModelConfigDoc" },
+      "description": "Read-only remote AI model registry configuration overrides"
+    },
+    "/users/{userId}/memories/{memoryId}": {
+      "schema": { "$ref": "#/entities/MemoryEntryDoc" },
+      "description": "Per-user categorized ALLORA Memory entries with explicit user control"
+    },
+    "/users/{userId}/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/ProjectDoc" },
+      "description": "Per-user ALLORA Workspace projects"
+    },
+    "/users/{userId}/personality_profiles/{profileId}": {
+      "schema": { "$ref": "#/entities/PersonalityProfileDoc" },
+      "description": "Per-user ALLORA Personality profile settings"
+    }
+  }
+}

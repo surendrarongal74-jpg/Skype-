@@ -1,0 +1,6 @@
+{
+  "name": "ALLORA",
+  "description": "ALLORA AI Personal Assistant — Travel & Architecture Console",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
