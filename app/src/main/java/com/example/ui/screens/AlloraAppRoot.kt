@@ -33,14 +33,22 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.core.view.WindowCompat
 import com.example.R
+import android.content.Context
 import android.graphics.BitmapFactory
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import com.example.agent.TaskExecutionEngine
 import com.example.core.AlloraAuthSessionState
 import com.example.core.AuthSessionViewModel
 import com.example.core.FirebaseAuthGateway
 import com.example.data.ai.AlloraAiService
 import com.example.data.ai.AlloraUnifiedToolRouter
+import com.example.data.ai.orchestrator.AiFailureCategory
+import com.example.data.ai.orchestrator.AiProviderException
+import com.example.data.ai.orchestrator.AiRequestManager
+import com.example.data.ai.orchestrator.ConversationSerializer
 import com.example.data.local.AlloraChatLocalStore
 import com.example.data.local.AlloraDatabase
 import com.example.data.local.AppearanceMode
@@ -69,11 +77,15 @@ import com.example.ui.viewmodel.AlloraAgentWorkspaceController
 import com.example.ui.viewmodel.AlloraViewModel
 import com.example.work.WeatherSyncWorker
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import androidx.compose.ui.platform.testTag
 
 private data class AlloraBackendDeps(
@@ -89,7 +101,8 @@ private data class AlloraBackendDeps(
     val locationTracker: TravelLocationTracker,
     val chatLocalStore: AlloraChatLocalStore,
     val preloadedChatThreads: List<AlloraChatThread>,
-    val preloadedActiveThreadId: String?
+    val preloadedActiveThreadId: String?,
+    val aiRequestManager: AiRequestManager
 )
 
 @Composable
@@ -128,6 +141,8 @@ fun AlloraAppRoot(
     LaunchedEffect(resolvedDarkTheme) {
         val wantLightBars = !resolvedDarkTheme
         if (lastAppliedLightBars == wantLightBars) return@LaunchedEffect
+        withFrameNanos { }
+        delay(120L)
         val activity = context as? ComponentActivity ?: return@LaunchedEffect
         val window = activity.window ?: return@LaunchedEffect
         val controller = WindowCompat.getInsetsController(window, window.decorView)
@@ -137,6 +152,9 @@ fun AlloraAppRoot(
     }
 
     LaunchedEffect(sessionViewModel) {
+        withFrameNanos { }
+        withFrameNanos { }
+        delay(120L)
         sessionViewModel.resolveStartupSession(context)
     }
 
@@ -186,8 +204,52 @@ fun AlloraAppRoot(
                             val liveController = LiveSessionController.getInstance(appContext)
                             val locationTracker = TravelLocationTracker.getInstance(appContext)
                             val chatLocalStore = AlloraChatLocalStore.forUser(appContext, uid)
-                            val preloadedChatThreads = chatLocalStore.loadThreads()
+                            val preloadedChatThreads = chatLocalStore.loadThreads().map { thread ->
+                                thread.copy(messages = ConversationSerializer.repairRichMessages(thread.messages))
+                            }
                             val preloadedActiveThreadId = chatLocalStore.loadActiveThreadId()
+                            val aiRequestManager = AiRequestManager.getInstance()
+                            val authTokenValidator: suspend (String) -> Unit = { expectedUid ->
+                                val currentUser = auth.currentUser
+                                if (currentUser == null || currentUser.uid != expectedUid) {
+                                    throw AiProviderException(
+                                        category = AiFailureCategory.AUTH_EXPIRED,
+                                        statusCode = 401,
+                                        retryable = false,
+                                        providerId = "FIREBASE_AUTH",
+                                        message = "Your Firebase authentication session expired. Please sign in again."
+                                    )
+                                }
+                                try {
+                                    val tokenResult = currentUser.getIdToken(false).await()
+                                    if (tokenResult?.token.isNullOrBlank()) {
+                                        throw AiProviderException(
+                                            category = AiFailureCategory.AUTH_EXPIRED,
+                                            statusCode = 401,
+                                            retryable = false,
+                                            providerId = "FIREBASE_AUTH",
+                                            message = "Your Firebase ID token is missing or expired. Please sign in again."
+                                        )
+                                    }
+                                } catch (netErr: FirebaseNetworkException) {
+                                    // Offline connectivity check will handle network outage without forcing sign-out.
+                                } catch (ioErr: IOException) {
+                                    // Transient network IO during token check should not trigger false auth expiry.
+                                } catch (authErr: FirebaseAuthException) {
+                                    throw AiProviderException(
+                                        category = AiFailureCategory.AUTH_EXPIRED,
+                                        statusCode = 401,
+                                        retryable = false,
+                                        providerId = "FIREBASE_AUTH",
+                                        message = "Your Firebase authentication session expired. Please sign in again.",
+                                        cause = authErr
+                                    )
+                                }
+                            }
+                            aiRequestManager.configureRuntimeHooks(
+                                networkCheck = { isDeviceOnline(appContext) },
+                                authValidator = authTokenValidator
+                            )
                             val taskCloudStore = AutonomousTaskFirestoreStore(db, auth)
                             val workspaceController = AlloraAgentWorkspaceController.createForUser(
                                 appContext = appContext,
@@ -232,7 +294,10 @@ fun AlloraAppRoot(
                                     geospatialRepo = geospatialRepo,
                                     firestoreRepo = firestoreRepo,
                                     unifiedToolRouter = unifiedRouter,
-                                    dynamicContextProvider = { workspaceController.buildDynamicAgentContext() }
+                                    aiRequestManager = aiRequestManager,
+                                    dynamicContextProvider = { workspaceController.buildDynamicAgentContext() },
+                                    userIdProvider = { uid },
+                                    authTokenValidator = authTokenValidator
                                 ),
                                 taskEngine = taskEngine,
                                 workspaceController = workspaceController,
@@ -240,7 +305,8 @@ fun AlloraAppRoot(
                                 locationTracker = locationTracker,
                                 chatLocalStore = chatLocalStore,
                                 preloadedChatThreads = preloadedChatThreads,
-                                preloadedActiveThreadId = preloadedActiveThreadId
+                                preloadedActiveThreadId = preloadedActiveThreadId,
+                                aiRequestManager = aiRequestManager
                             )
                         }
                     }
@@ -318,7 +384,9 @@ fun AlloraAppRoot(
                                         taskEngine = deps.taskEngine,
                                         workspaceController = deps.workspaceController,
                                         preloadedChatThreads = deps.preloadedChatThreads,
-                                        preloadedActiveThreadId = deps.preloadedActiveThreadId
+                                        preloadedActiveThreadId = deps.preloadedActiveThreadId,
+                                        aiRequestManager = deps.aiRequestManager,
+                                        preloadedThreadsAlreadyRepaired = true
                                     )
                                 }
                             }
@@ -869,4 +937,20 @@ private fun AlloraAuthenticatedShell(
                 }
             }
     }
+}
+
+private fun isDeviceOnline(context: Context): Boolean {
+    return runCatching {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return true
+        val activeNetwork = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(activeNetwork) ?: return false
+        val hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        val notSuspended = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)
+        } else {
+            true
+        }
+        hasInternet && notSuspended
+    }.getOrDefault(true)
 }

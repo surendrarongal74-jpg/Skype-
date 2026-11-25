@@ -255,6 +255,27 @@ test("AI messages allow owner create/read/delete and forbid update or cross-user
   await assertFails(msgRef.update({ text: "Tampered text" }));
   await assertFails(bobDb.collection("users").doc(ALICE_UID).collection("ai_messages").doc("msg_1").get());
   await assertSucceeds(msgRef.delete());
+
+  const clientSubMsgRef = aliceDb.collection("users").doc(ALICE_UID).collection("ai_messages").doc("msg-u-sub_1b7a9985aa4d");
+  await assertSucceeds(
+    clientSubMsgRef.set({
+      userId: ALICE_UID,
+      isUser: true,
+      text: "Hello",
+      isError: false,
+      createdAt: ts,
+    })
+  );
+  await assertFails(
+    clientSubMsgRef.set({
+      userId: ALICE_UID,
+      isUser: true,
+      text: "Hello",
+      isError: false,
+      createdAt: pastTimestamp(1000),
+    })
+  );
+  await assertSucceeds(clientSubMsgRef.delete());
 });
 
 test("Cross-user access to trips and bookings is rejected", async () => {

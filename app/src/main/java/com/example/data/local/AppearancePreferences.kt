@@ -7,8 +7,10 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import java.io.IOException
 
@@ -69,6 +71,7 @@ class AppearancePreferencesStore(
         .map { prefs ->
             AppearanceMode.fromStorageKey(prefs[KEY_APPEARANCE_MODE])
         }
+        .flowOn(Dispatchers.IO)
 
     fun appearanceModeForUserFlow(userId: String?): Flow<AppearanceMode> = dataStore.data
         .catch { error ->
@@ -86,6 +89,7 @@ class AppearancePreferencesStore(
                 AppearanceMode.fromStorageKey(prefs[userKey])
             }
         }
+        .flowOn(Dispatchers.IO)
 
     val sessionUxPrefsFlow: Flow<SessionUxPreferences> = dataStore.data
         .catch { error ->
@@ -101,6 +105,7 @@ class AppearancePreferencesStore(
                 signedOutExplicitly = prefs[KEY_SIGNED_OUT_EXPLICITLY] == "true"
             )
         }
+        .flowOn(Dispatchers.IO)
 
     suspend fun hasUserAppearancePreference(userId: String): Boolean {
         if (userId.isBlank()) return false

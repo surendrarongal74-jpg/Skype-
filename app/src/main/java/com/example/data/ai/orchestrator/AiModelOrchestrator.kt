@@ -45,7 +45,9 @@ class AiModelOrchestrator(
     private val validator: ResponseValidator = ResponseValidator(),
     val usageLimiter: AiUsageLimiter = AiUsageLimiter(),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
-    private val sleepFn: suspend (Long) -> Unit = { delay(it) }
+    private val sleepFn: suspend (Long) -> Unit = { delay(it) },
+    private val isNetworkAvailable: () -> Boolean = { true },
+    private val authTokenValidator: (suspend (String) -> Unit)? = null
 ) {
     private val _userPreferences = MutableStateFlow(AiUserPreferences())
     val userPreferences: StateFlow<AiUserPreferences> = _userPreferences.asStateFlow()
@@ -67,8 +69,22 @@ class AiModelOrchestrator(
     @Volatile
     var telemetrySink: AiTelemetrySink? = null
 
+    @Volatile
+    private var runtimeNetworkCheck: (() -> Boolean)? = null
+
+    @Volatile
+    private var runtimeAuthValidator: (suspend (String) -> Unit)? = null
+
     init {
         healthMonitor.ensureInitializedFor(registry.getAllModels())
+    }
+
+    fun configureRuntimeHooks(
+        networkCheck: (() -> Boolean)? = null,
+        authValidator: (suspend (String) -> Unit)? = null
+    ) {
+        runtimeNetworkCheck = networkCheck
+        runtimeAuthValidator = authValidator
     }
 
     fun updateUserPreferences(prefs: AiUserPreferences) {
@@ -119,6 +135,55 @@ class AiModelOrchestrator(
         onAttemptReset: () -> Unit = {}
     ): OrchestratedTurnResult {
         val turnStartMs = clockMs()
+        if (snapshot.userPrompt.isBlank() && snapshot.attachedBitmaps.isEmpty() && snapshot.audioWavBytes == null) {
+            throw AiProviderException(
+                category = AiFailureCategory.INVALID_REQUEST,
+                statusCode = 400,
+                retryable = false,
+                providerId = "ORCHESTRATOR",
+                message = "Please enter a message before sending."
+            )
+        }
+
+        val activeAuthValidator = runtimeAuthValidator ?: authTokenValidator
+        if (activeAuthValidator != null) {
+            try {
+                activeAuthValidator.invoke(snapshot.userId)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                val mapped = AiFailureClassifier.toProviderException(t, AiProviderType.FIREBASE_AI, "auth_gate")
+                val authOrNetEx = if (mapped.category == AiFailureCategory.NETWORK_ERROR ||
+                    mapped.category == AiFailureCategory.TIMEOUT
+                ) {
+                    mapped
+                } else {
+                    AiProviderException(
+                        category = AiFailureCategory.AUTH_EXPIRED,
+                        statusCode = 401,
+                        retryable = false,
+                        providerId = "FIREBASE_AUTH",
+                        modelId = "auth_gate",
+                        message = mapped.message.ifBlank { "Your Firebase authentication session expired. Please sign in again." },
+                        cause = t
+                    )
+                }
+                emitPhase(AiStatusPhase.UNAVAILABLE, onStatusPhase)
+                throw authOrNetEx
+            }
+        }
+
+        val activeNetworkCheck = runtimeNetworkCheck ?: isNetworkAvailable
+        if (!activeNetworkCheck.invoke()) {
+            emitPhase(AiStatusPhase.UNAVAILABLE, onStatusPhase)
+            throw AiProviderException(
+                category = AiFailureCategory.NETWORK_ERROR,
+                retryable = true,
+                providerId = "CONNECTIVITY",
+                message = "No active internet connection. Please reconnect and tap Retry."
+            )
+        }
+
         usageLimiter.checkAndConsumeRequest(snapshot.userId)
 
         emitPhase(AiStatusPhase.UNDERSTANDING, onStatusPhase)
@@ -192,154 +257,35 @@ class AiModelOrchestrator(
             ).buildEnrichedSystemPrompt()
             var candidateLastOpenAiResponseId: String? = null
 
-            if (candidateIndex == 0) {
-                emitPhase(AiStatusPhase.CONNECTING, onStatusPhase)
-            } else {
-                emitPhase(AiStatusPhase.SWITCHING_MODEL, onStatusPhase)
-                onAttemptReset()
-                emitPhase(AiStatusPhase.CONTINUING_TASK, onStatusPhase)
-            }
-
-            try {
-                val attemptStartMs = clockMs()
-                var firstTtftMs = 0L
-                var promptTokensSum = 0
-                var completionTokensSum = 0
-
-                val attemptMessages = workingMessages.toMutableList()
-                var round = completedToolRounds
-
-                var emittedGenerating = false
-                var response = executeSingleAdapterCall(
-                    adapter = adapter,
-                    config = candidate,
-                    request = UnifiedAiRequest(
-                        requestId = "${snapshot.requestId}_c${candidateIndex}_r$round",
-                        taskProfile = taskProfile,
-                        systemPrompt = attemptSystemPrompt,
-                        messages = attemptMessages,
-                        tools = if (toolExecutor != null && responseFormatSchema == null) tools else emptyList(),
-                        temperature = temperature,
-                        maxTokens = maxTokens,
-                        responseFormatName = responseFormatName,
-                        responseFormatSchema = responseFormatSchema,
-                        timeoutMs = candidate.timeoutMs.coerceAtLeast(taskProfile.defaultTimeoutMs),
-                        stream = stream,
-                        structuredJsonExpected = structuredJsonExpected,
-                        enableGoogleSearchGrounding = enableGrounding,
-                        previousOpenAiResponseId = candidateLastOpenAiResponseId
-                    ),
-                    onDelta = { delta ->
-                        if (!emittedGenerating) {
-                            emittedGenerating = true
-                            emitPhase(AiStatusPhase.GENERATING, onStatusPhase)
-                        }
-                        onStreamTextDelta(delta)
-                    }
-                )
-                if (candidate.providerType == AiProviderType.OPENAI_COMPATIBLE && !response.openAiResponseId.isNullOrBlank()) {
-                    candidateLastOpenAiResponseId = response.openAiResponseId
-                }
-                validator.validate(
-                    response = response,
-                    request = UnifiedAiRequest(
-                        requestId = snapshot.requestId,
-                        taskProfile = taskProfile,
-                        systemPrompt = attemptSystemPrompt,
-                        messages = attemptMessages,
-                        tools = tools,
-                        responseFormatSchema = responseFormatSchema,
-                        structuredJsonExpected = structuredJsonExpected,
-                        enableGoogleSearchGrounding = enableGrounding
-                    ),
-                    config = candidate
-                )
-
-                firstTtftMs = response.ttftMs
-                promptTokensSum += response.promptTokensEstimate
-                completionTokensSum += response.completionTokensEstimate
-                citations.addAll(response.citations)
-
-                while (response.toolCalls.isNotEmpty() && round < maxToolRounds && toolExecutor != null) {
-                    round++
-                    attemptMessages.add(
-                        UnifiedMessage(
-                            role = "assistant",
-                            text = response.text.ifBlank { null },
-                            toolCalls = response.toolCalls,
-                            preservedGeminiContent = response.rawGeminiContent,
-                            openAiResponseId = response.openAiResponseId
-                        )
-                    )
-                    workingMessages.clear()
-                    workingMessages.addAll(attemptMessages)
-
-                    for (call in response.toolCalls) {
-                        val isBrowserTool = call.name.startsWith("browser_")
-                        if (isBrowserTool) {
-                            emitPhase(AiStatusPhase.CALLING_BROWSER_TOOL, onStatusPhase)
-                        }
-                        val toolStart = clockMs()
-                        val (execOut, wasReused) = toolLedger.executeIdempotently(
-                            toolName = call.name,
-                            canonicalArgsJson = call.argumentsJson
-                        ) {
-                            if (isBrowserTool) {
-                                emitPhase(AiStatusPhase.WAITING_FOR_BROWSER_RESULT, onStatusPhase)
-                            }
-                            toolExecutor(call.name, parseJsonArgs(call.argumentsJson))
-                        }
-                        totalToolDurationMs += (clockMs() - toolStart).coerceAtLeast(0L)
-
-                        if (!wasReused) {
-                            traces.add(execOut.trace)
-                            if (execOut.embeddedBlocks.isNotEmpty()) {
-                                embeddedBlocks.addAll(execOut.embeddedBlocks)
-                            }
-                            if (execOut.createdTripId != null) {
-                                createdTripId = execOut.createdTripId
-                            }
-                        }
-
-                        execOut.json["session_id"]?.jsonPrimitive?.contentOrNull
-                            ?.takeIf { it.isNotBlank() }?.let { currentBrowserSessionId = it }
-                        execOut.json["url"]?.jsonPrimitive?.contentOrNull
-                            ?.takeIf { it.isNotBlank() }?.let { currentBrowserUrl = it }
-                        currentToolResultSummary = "${call.name}: ${execOut.trace.summary}"
-
-                        attemptMessages.add(
-                            UnifiedMessage(
-                                role = "tool",
-                                toolCallId = call.id,
-                                name = call.name,
-                                text = execOut.json.toString()
-                            )
-                        )
-                        // Checkpoint immediately after each tool so partial batch failures never re-run completed tools.
-                        workingMessages.clear()
-                        workingMessages.addAll(attemptMessages)
-                    }
-
-                    completedToolRounds = round
-
-                    emitPhase(AiStatusPhase.GENERATING, onStatusPhase)
+            var singleCandidateRetried = false
+            while (true) {
+                if (candidateIndex == 0 && !singleCandidateRetried) {
+                    emitPhase(AiStatusPhase.CONNECTING, onStatusPhase)
+                } else if (candidateIndex > 0 || singleCandidateRetried) {
+                    emitPhase(AiStatusPhase.SWITCHING_MODEL, onStatusPhase)
                     onAttemptReset()
+                    emitPhase(AiStatusPhase.CONTINUING_TASK, onStatusPhase)
+                }
 
-                    val refreshedPrompt = snapshot.copy(
-                        browserSessionId = currentBrowserSessionId,
-                        activeBrowserUrl = currentBrowserUrl,
-                        lastToolResultSummary = currentToolResultSummary
-                    ).buildEnrichedSystemPrompt()
+                try {
+                    val attemptStartMs = clockMs()
+                    var firstTtftMs = 0L
+                    var promptTokensSum = 0
+                    var completionTokensSum = 0
 
-                    response = executeSingleAdapterCall(
+                    val attemptMessages = workingMessages.toMutableList()
+                    var round = completedToolRounds
+
+                    var emittedGenerating = false
+                    var response = executeSingleAdapterCall(
                         adapter = adapter,
                         config = candidate,
                         request = UnifiedAiRequest(
                             requestId = "${snapshot.requestId}_c${candidateIndex}_r$round",
                             taskProfile = taskProfile,
-                            systemPrompt = refreshedPrompt,
+                            systemPrompt = attemptSystemPrompt,
                             messages = attemptMessages,
-                            tools = if (round < maxToolRounds) tools else emptyList(),
+                            tools = if (toolExecutor != null && responseFormatSchema == null) tools else emptyList(),
                             temperature = temperature,
                             maxTokens = maxTokens,
                             responseFormatName = responseFormatName,
@@ -350,7 +296,13 @@ class AiModelOrchestrator(
                             enableGoogleSearchGrounding = enableGrounding,
                             previousOpenAiResponseId = candidateLastOpenAiResponseId
                         ),
-                        onDelta = onStreamTextDelta
+                        onDelta = { delta ->
+                            if (!emittedGenerating) {
+                                emittedGenerating = true
+                                emitPhase(AiStatusPhase.GENERATING, onStatusPhase)
+                            }
+                            onStreamTextDelta(delta)
+                        }
                     )
                     if (candidate.providerType == AiProviderType.OPENAI_COMPATIBLE && !response.openAiResponseId.isNullOrBlank()) {
                         candidateLastOpenAiResponseId = response.openAiResponseId
@@ -360,149 +312,297 @@ class AiModelOrchestrator(
                         request = UnifiedAiRequest(
                             requestId = snapshot.requestId,
                             taskProfile = taskProfile,
-                            systemPrompt = refreshedPrompt,
+                            systemPrompt = attemptSystemPrompt,
                             messages = attemptMessages,
-                            tools = if (round < maxToolRounds) tools else emptyList(),
+                            tools = tools,
                             responseFormatSchema = responseFormatSchema,
                             structuredJsonExpected = structuredJsonExpected,
                             enableGoogleSearchGrounding = enableGrounding
                         ),
                         config = candidate
                     )
+
+                    firstTtftMs = response.ttftMs
                     promptTokensSum += response.promptTokensEstimate
                     completionTokensSum += response.completionTokensEstimate
                     citations.addAll(response.citations)
-                }
 
-                // If model still returned tool calls right at maxToolRounds with empty text, run one final synthesis pass
-                if (response.text.isBlank() && response.toolCalls.isNotEmpty() && traces.isNotEmpty()) {
-                    emitPhase(AiStatusPhase.GENERATING, onStatusPhase)
-                    onAttemptReset()
-                    val finalPrompt = snapshot.copy(
-                        browserSessionId = currentBrowserSessionId,
-                        activeBrowserUrl = currentBrowserUrl,
-                        lastToolResultSummary = currentToolResultSummary
-                    ).buildEnrichedSystemPrompt()
-                    val summaryResp = executeSingleAdapterCall(
-                        adapter = adapter,
+                    while (response.toolCalls.isNotEmpty() && round < maxToolRounds && toolExecutor != null) {
+                        round++
+                        attemptMessages.add(
+                            UnifiedMessage(
+                                role = "assistant",
+                                text = response.text.ifBlank { null },
+                                toolCalls = response.toolCalls,
+                                preservedGeminiContent = response.rawGeminiContent,
+                                openAiResponseId = response.openAiResponseId
+                            )
+                        )
+                        workingMessages.clear()
+                        workingMessages.addAll(attemptMessages)
+
+                        for (call in response.toolCalls) {
+                            val isBrowserTool = call.name.startsWith("browser_")
+                            if (isBrowserTool) {
+                                emitPhase(AiStatusPhase.CALLING_BROWSER_TOOL, onStatusPhase)
+                            }
+                            val toolStart = clockMs()
+                            val (execOut, wasReused) = toolLedger.executeIdempotently(
+                                toolName = call.name,
+                                canonicalArgsJson = call.argumentsJson
+                            ) {
+                                if (isBrowserTool) {
+                                    emitPhase(AiStatusPhase.WAITING_FOR_BROWSER_RESULT, onStatusPhase)
+                                }
+                                toolExecutor(call.name, parseJsonArgs(call.argumentsJson))
+                            }
+                            totalToolDurationMs += (clockMs() - toolStart).coerceAtLeast(0L)
+
+                            if (!wasReused) {
+                                traces.add(execOut.trace)
+                                if (execOut.embeddedBlocks.isNotEmpty()) {
+                                    embeddedBlocks.addAll(execOut.embeddedBlocks)
+                                }
+                                if (execOut.createdTripId != null) {
+                                    createdTripId = execOut.createdTripId
+                                }
+                            }
+
+                            execOut.json["session_id"]?.jsonPrimitive?.contentOrNull
+                                ?.takeIf { it.isNotBlank() }?.let { currentBrowserSessionId = it }
+                            execOut.json["url"]?.jsonPrimitive?.contentOrNull
+                                ?.takeIf { it.isNotBlank() }?.let { currentBrowserUrl = it }
+                            currentToolResultSummary = "${call.name}: ${execOut.trace.summary}"
+
+                            attemptMessages.add(
+                                UnifiedMessage(
+                                    role = "tool",
+                                    toolCallId = call.id,
+                                    name = call.name,
+                                    text = execOut.json.toString()
+                                )
+                            )
+                            // Checkpoint immediately after each tool so partial batch failures never re-run completed tools.
+                            workingMessages.clear()
+                            workingMessages.addAll(attemptMessages)
+                        }
+
+                        completedToolRounds = round
+
+                        emitPhase(AiStatusPhase.GENERATING, onStatusPhase)
+                        onAttemptReset()
+
+                        val refreshedPrompt = snapshot.copy(
+                            browserSessionId = currentBrowserSessionId,
+                            activeBrowserUrl = currentBrowserUrl,
+                            lastToolResultSummary = currentToolResultSummary
+                        ).buildEnrichedSystemPrompt()
+
+                        response = executeSingleAdapterCall(
+                            adapter = adapter,
+                            config = candidate,
+                            request = UnifiedAiRequest(
+                                requestId = "${snapshot.requestId}_c${candidateIndex}_r$round",
+                                taskProfile = taskProfile,
+                                systemPrompt = refreshedPrompt,
+                                messages = attemptMessages,
+                                tools = if (round < maxToolRounds) tools else emptyList(),
+                                temperature = temperature,
+                                maxTokens = maxTokens,
+                                responseFormatName = responseFormatName,
+                                responseFormatSchema = responseFormatSchema,
+                                timeoutMs = candidate.timeoutMs.coerceAtLeast(taskProfile.defaultTimeoutMs),
+                                stream = stream,
+                                structuredJsonExpected = structuredJsonExpected,
+                                enableGoogleSearchGrounding = enableGrounding,
+                                previousOpenAiResponseId = candidateLastOpenAiResponseId
+                            ),
+                            onDelta = onStreamTextDelta
+                        )
+                        if (candidate.providerType == AiProviderType.OPENAI_COMPATIBLE && !response.openAiResponseId.isNullOrBlank()) {
+                            candidateLastOpenAiResponseId = response.openAiResponseId
+                        }
+                        validator.validate(
+                            response = response,
+                            request = UnifiedAiRequest(
+                                requestId = snapshot.requestId,
+                                taskProfile = taskProfile,
+                                systemPrompt = refreshedPrompt,
+                                messages = attemptMessages,
+                                tools = if (round < maxToolRounds) tools else emptyList(),
+                                responseFormatSchema = responseFormatSchema,
+                                structuredJsonExpected = structuredJsonExpected,
+                                enableGoogleSearchGrounding = enableGrounding
+                            ),
+                            config = candidate
+                        )
+                        promptTokensSum += response.promptTokensEstimate
+                        completionTokensSum += response.completionTokensEstimate
+                        citations.addAll(response.citations)
+                    }
+
+                    // If model still returned tool calls right at maxToolRounds with empty text, run one final synthesis pass
+                    if (response.text.isBlank() && response.toolCalls.isNotEmpty() && traces.isNotEmpty()) {
+                        emitPhase(AiStatusPhase.GENERATING, onStatusPhase)
+                        onAttemptReset()
+                        val finalPrompt = snapshot.copy(
+                            browserSessionId = currentBrowserSessionId,
+                            activeBrowserUrl = currentBrowserUrl,
+                            lastToolResultSummary = currentToolResultSummary
+                        ).buildEnrichedSystemPrompt()
+                        val summaryResp = executeSingleAdapterCall(
+                            adapter = adapter,
+                            config = candidate,
+                            request = UnifiedAiRequest(
+                                requestId = "${snapshot.requestId}_c${candidateIndex}_final",
+                                taskProfile = taskProfile,
+                                systemPrompt = finalPrompt,
+                                messages = attemptMessages,
+                                tools = emptyList(),
+                                temperature = temperature,
+                                maxTokens = maxTokens,
+                                responseFormatName = responseFormatName,
+                                responseFormatSchema = responseFormatSchema,
+                                timeoutMs = candidate.timeoutMs.coerceAtLeast(taskProfile.defaultTimeoutMs),
+                                stream = stream,
+                                structuredJsonExpected = structuredJsonExpected,
+                                enableGoogleSearchGrounding = enableGrounding,
+                                previousOpenAiResponseId = candidateLastOpenAiResponseId
+                            ),
+                            onDelta = onStreamTextDelta
+                        )
+                        validator.validate(
+                            response = summaryResp,
+                            request = UnifiedAiRequest(
+                                requestId = snapshot.requestId,
+                                taskProfile = taskProfile,
+                                systemPrompt = enrichedSystemPrompt,
+                                messages = attemptMessages,
+                                tools = emptyList(),
+                                responseFormatSchema = responseFormatSchema,
+                                structuredJsonExpected = structuredJsonExpected
+                            ),
+                            config = candidate
+                        )
+                        response = summaryResp
+                        promptTokensSum += summaryResp.promptTokensEstimate
+                        completionTokensSum += summaryResp.completionTokensEstimate
+                        citations.addAll(summaryResp.citations)
+                    }
+
+                    val totalLatency = (clockMs() - attemptStartMs).coerceAtLeast(1L)
+                    healthMonitor.recordSuccess(
                         config = candidate,
-                        request = UnifiedAiRequest(
-                            requestId = "${snapshot.requestId}_c${candidateIndex}_final",
-                            taskProfile = taskProfile,
-                            systemPrompt = finalPrompt,
-                            messages = attemptMessages,
-                            tools = emptyList(),
-                            temperature = temperature,
-                            maxTokens = maxTokens,
-                            responseFormatName = responseFormatName,
-                            responseFormatSchema = responseFormatSchema,
-                            timeoutMs = candidate.timeoutMs.coerceAtLeast(taskProfile.defaultTimeoutMs),
-                            stream = stream,
-                            structuredJsonExpected = structuredJsonExpected,
-                            enableGoogleSearchGrounding = enableGrounding,
-                            previousOpenAiResponseId = candidateLastOpenAiResponseId
-                        ),
-                        onDelta = onStreamTextDelta
+                        latencyMs = totalLatency,
+                        ttftMs = firstTtftMs
                     )
-                    validator.validate(
-                        response = summaryResp,
-                        request = UnifiedAiRequest(
-                            requestId = snapshot.requestId,
-                            taskProfile = taskProfile,
-                            systemPrompt = enrichedSystemPrompt,
-                            messages = attemptMessages,
-                            tools = emptyList(),
-                            responseFormatSchema = responseFormatSchema,
-                            structuredJsonExpected = structuredJsonExpected
-                        ),
-                        config = candidate
+                    usageLimiter.recordTokenUsage(
+                        userId = snapshot.userId,
+                        totalTokens = (promptTokensSum + completionTokensSum).toLong()
                     )
-                    response = summaryResp
-                    promptTokensSum += summaryResp.promptTokensEstimate
-                    completionTokensSum += summaryResp.completionTokensEstimate
-                    citations.addAll(summaryResp.citations)
-                }
 
-                val totalLatency = (clockMs() - attemptStartMs).coerceAtLeast(1L)
-                healthMonitor.recordSuccess(
-                    config = candidate,
-                    latencyMs = totalLatency,
-                    ttftMs = firstTtftMs
-                )
-                usageLimiter.recordTokenUsage(
-                    userId = snapshot.userId,
-                    totalTokens = (promptTokensSum + completionTokensSum).toLong()
-                )
+                    val estimatedCost = ((promptTokensSum / 1000.0) * candidate.costPer1kInputUsd) +
+                        ((completionTokensSum / 1000.0) * candidate.costPer1kOutputUsd)
 
-                val estimatedCost = ((promptTokensSum / 1000.0) * candidate.costPer1kInputUsd) +
-                    ((completionTokensSum / 1000.0) * candidate.costPer1kOutputUsd)
+                    val diagnostics = AiRequestDiagnostics(
+                        requestId = snapshot.requestId,
+                        taskProfile = taskProfile,
+                        selectedModelId = candidate.modelId,
+                        selectedModelName = candidate.displayName,
+                        providerType = candidate.providerType,
+                        attemptedModels = attemptedModels.toList(),
+                        failoverEvents = failoverEvents.toList(),
+                        ttftMs = firstTtftMs,
+                        totalLatencyMs = (clockMs() - turnStartMs).coerceAtLeast(1L),
+                        failoverDelayMs = totalFailoverDelayMs,
+                        toolExecutionDurationMs = totalToolDurationMs,
+                        promptTokensEstimate = promptTokensSum,
+                        completionTokensEstimate = completionTokensSum,
+                        estimatedCostUsd = estimatedCost,
+                        statusPhase = AiStatusPhase.IDLE,
+                        statusText = AiStatusPhase.IDLE.subtleMessage,
+                        timestampMs = clockMs()
+                    )
+                    _latestDiagnostics.value = diagnostics
+                    telemetrySink?.onRequestCompleted(snapshot.userId, diagnostics)
+                    emitPhase(AiStatusPhase.IDLE, onStatusPhase)
 
-                val diagnostics = AiRequestDiagnostics(
-                    requestId = snapshot.requestId,
-                    taskProfile = taskProfile,
-                    selectedModelId = candidate.modelId,
-                    selectedModelName = candidate.displayName,
-                    providerType = candidate.providerType,
-                    attemptedModels = attemptedModels.toList(),
-                    failoverEvents = failoverEvents.toList(),
-                    ttftMs = firstTtftMs,
-                    totalLatencyMs = (clockMs() - turnStartMs).coerceAtLeast(1L),
-                    failoverDelayMs = totalFailoverDelayMs,
-                    toolExecutionDurationMs = totalToolDurationMs,
-                    promptTokensEstimate = promptTokensSum,
-                    completionTokensEstimate = completionTokensSum,
-                    estimatedCostUsd = estimatedCost,
-                    statusPhase = AiStatusPhase.IDLE,
-                    statusText = AiStatusPhase.IDLE.subtleMessage,
-                    timestampMs = clockMs()
-                )
-                _latestDiagnostics.value = diagnostics
-                telemetrySink?.onRequestCompleted(snapshot.userId, diagnostics)
-                emitPhase(AiStatusPhase.IDLE, onStatusPhase)
-
-                return OrchestratedTurnResult(
-                    text = response.text.trim(),
-                    toolCalls = response.toolCalls,
-                    citations = citations.distinctBy { it.url },
-                    toolTraces = traces,
-                    embeddedBlocks = embeddedBlocks,
-                    createdTripId = createdTripId,
-                    diagnostics = diagnostics
-                )
-            } catch (ce: CancellationException) {
-                if (ce is TimeoutCancellationException) {
-                    val timeoutEx = AiFailureClassifier.toProviderException(ce, candidate.providerType, candidate.modelId)
+                    return OrchestratedTurnResult(
+                        text = response.text.trim(),
+                        toolCalls = response.toolCalls,
+                        citations = citations.distinctBy { it.url },
+                        toolTraces = traces,
+                        embeddedBlocks = embeddedBlocks,
+                        createdTripId = createdTripId,
+                        diagnostics = diagnostics
+                    )
+                } catch (ce: CancellationException) {
+                    if (ce is TimeoutCancellationException) {
+                        val timeoutEx = AiFailureClassifier.toProviderException(ce, candidate.providerType, candidate.modelId)
+                        val nextCandidate = candidates.getOrNull(candidateIndex + 1)
+                        val shouldRetrySingle = candidates.size == 1 && !singleCandidateRetried && activeNetworkCheck.invoke()
+                        if (shouldRetrySingle) {
+                            singleCandidateRetried = true
+                            val delayMs = computeBackoffMs(0, timeoutEx)
+                            totalFailoverDelayMs += delayMs
+                            if (delayMs > 0L) sleepFn(delayMs)
+                            continue
+                        }
+                        val canFailover = timeoutEx.category.shouldTriggerFailover && nextCandidate != null
+                        healthMonitor.recordFailure(candidate, timeoutEx, triggeredFailover = canFailover)
+                        lastError = timeoutEx
+                        if (!canFailover) break
+                        val event = recordFailover(candidate, nextCandidate!!, timeoutEx, taskProfile, snapshot.userId, candidateIndex)
+                        failoverEvents.add(event)
+                        totalFailoverDelayMs += event.delayMs
+                        if (event.delayMs > 0L) sleepFn(event.delayMs)
+                        break
+                    } else {
+                        emitPhase(AiStatusPhase.IDLE, onStatusPhase)
+                        throw ce
+                    }
+                } catch (t: Throwable) {
+                    val providerEx = AiFailureClassifier.toProviderException(t, candidate.providerType, candidate.modelId)
+                    runCatching {
+                        android.util.Log.w(
+                            "AiModelOrchestrator",
+                            "Candidate ${candidate.modelId} (${candidate.providerType}) failed category=${providerEx.category} status=${providerEx.statusCode}: ${AiFailureClassifier.sanitizeDetail(providerEx.message, 120)}"
+                        )
+                    }
+                    if (providerEx.category == AiFailureCategory.INVALID_REQUEST) {
+                        repairWorkingMessagesInPlace(workingMessages)
+                    }
                     val nextCandidate = candidates.getOrNull(candidateIndex + 1)
-                    val canFailover = timeoutEx.category.shouldTriggerFailover && nextCandidate != null
-                    healthMonitor.recordFailure(candidate, timeoutEx, triggeredFailover = canFailover)
-                    lastError = timeoutEx
-                    if (!canFailover) break
-                    val event = recordFailover(candidate, nextCandidate!!, timeoutEx, taskProfile, snapshot.userId)
+                    val shouldRetrySingle = candidates.size == 1 &&
+                        !singleCandidateRetried &&
+                        activeNetworkCheck.invoke() &&
+                        (providerEx.category == AiFailureCategory.SERVER_ERROR_5XX ||
+                            providerEx.category == AiFailureCategory.STREAM_INTERRUPTED ||
+                            providerEx.category == AiFailureCategory.TIMEOUT)
+                    if (shouldRetrySingle) {
+                        singleCandidateRetried = true
+                        val delayMs = computeBackoffMs(0, providerEx)
+                        totalFailoverDelayMs += delayMs
+                        if (delayMs > 0L) sleepFn(delayMs)
+                        continue
+                    }
+                    val canFailover = providerEx.category.shouldTriggerFailover && nextCandidate != null
+                    healthMonitor.recordFailure(candidate, providerEx, triggeredFailover = canFailover)
+                    lastError = providerEx
+
+                    if (!canFailover) {
+                        break
+                    }
+
+                    val event = recordFailover(candidate, nextCandidate!!, providerEx, taskProfile, snapshot.userId, candidateIndex)
                     failoverEvents.add(event)
                     totalFailoverDelayMs += event.delayMs
                     if (event.delayMs > 0L) sleepFn(event.delayMs)
-                } else {
-                    emitPhase(AiStatusPhase.IDLE, onStatusPhase)
-                    throw ce
-                }
-            } catch (t: Throwable) {
-                val providerEx = AiFailureClassifier.toProviderException(t, candidate.providerType, candidate.modelId)
-                if (providerEx.category == AiFailureCategory.INVALID_REQUEST) {
-                    repairWorkingMessagesInPlace(workingMessages)
-                }
-                val nextCandidate = candidates.getOrNull(candidateIndex + 1)
-                val canFailover = providerEx.category.shouldTriggerFailover && nextCandidate != null
-                healthMonitor.recordFailure(candidate, providerEx, triggeredFailover = canFailover)
-                lastError = providerEx
-
-                if (!canFailover) {
                     break
                 }
-
-                val event = recordFailover(candidate, nextCandidate!!, providerEx, taskProfile, snapshot.userId)
-                failoverEvents.add(event)
-                totalFailoverDelayMs += event.delayMs
-                if (event.delayMs > 0L) sleepFn(event.delayMs)
+            }
+            if (lastError != null && !lastError.category.shouldTriggerFailover) {
+                break
             }
         }
 
@@ -542,14 +642,25 @@ class AiModelOrchestrator(
         return adapter.execute(config, request, onDelta)
     }
 
+    private fun computeBackoffMs(attemptIndex: Int, err: AiProviderException): Long {
+        err.retryAfterMs?.let { retryMs ->
+            if (retryMs > 0L) return retryMs.coerceIn(100L, 4_000L)
+        }
+        val base = if (err.category == AiFailureCategory.RATE_LIMIT_429) 320L else 140L
+        val exp = base shl attemptIndex.coerceIn(0, 3)
+        val jitter = kotlin.random.Random.nextLong(0L, 80L)
+        return (exp + jitter).coerceAtMost(2_500L)
+    }
+
     private fun recordFailover(
         from: AiModelConfig,
         to: AiModelConfig,
         err: AiProviderException,
         taskProfile: AiTaskProfile,
-        userId: String
+        userId: String,
+        attemptIndex: Int = 0
     ): AiFailoverEvent {
-        val pacingDelay = if (err.category == AiFailureCategory.RATE_LIMIT_429) 180L else 90L
+        val pacingDelay = computeBackoffMs(attemptIndex, err)
         val event = AiFailoverEvent(
             fromModelId = from.modelId,
             fromModelName = from.displayName,
@@ -557,7 +668,7 @@ class AiModelOrchestrator(
             toModelName = to.displayName,
             reasonCategory = err.category,
             statusCode = err.statusCode,
-            detail = err.message.take(180),
+            detail = AiFailureClassifier.sanitizeDetail(err.message, 180),
             delayMs = pacingDelay,
             timestampMs = clockMs()
         )
@@ -628,7 +739,7 @@ class AiModelOrchestrator(
     }
 
     companion object {
-        private const val MAX_FAILOVER_MODELS = 4
+        private const val MAX_FAILOVER_MODELS = 5
         private const val DEFAULT_MAX_TOOL_ROUNDS = 5
 
         fun defaultAdapters(

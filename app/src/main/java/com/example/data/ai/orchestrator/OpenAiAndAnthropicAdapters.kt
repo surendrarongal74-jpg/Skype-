@@ -122,6 +122,7 @@ class OpenAiCompatibleProviderAdapter(
                                         parseResponsesSseStream(
                                             response = res,
                                             fallbackModel = config.providerModelName,
+                                            modelId = config.modelId,
                                             request = request,
                                             startMs = startMs,
                                             onTextDelta = onTextDelta
@@ -253,11 +254,27 @@ class OpenAiCompatibleProviderAdapter(
         return AiProviderException(
             category = category,
             statusCode = code,
-            retryAfterMs = retryAfterHeader?.toLongOrNull()?.times(1000L),
+            retryAfterMs = parseRetryAfterMs(retryAfterHeader),
             providerId = providerType.name,
             modelId = modelId,
-            message = "OpenAI Responses HTTP $code: ${rawErr.take(200)}"
+            message = "OpenAI Responses HTTP $code: ${sanitizeHttpErrorMessage(rawErr, code)}"
         )
+    }
+
+    private fun parseRetryAfterMs(header: String?): Long? {
+        val seconds = header?.trim()?.toDoubleOrNull() ?: return null
+        if (!seconds.isFinite() || seconds <= 0.0) return null
+        return (seconds * 1000.0).toLong().coerceIn(500L, 120_000L)
+    }
+
+    private fun sanitizeHttpErrorMessage(rawErr: String, code: Int): String {
+        val parsed = runCatching {
+            val obj = OpenRouterClient.jsonParser.parseToJsonElement(rawErr).jsonObject
+            (obj["error"] as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull
+                ?: obj["message"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull()
+        val chosen = parsed?.takeIf { it.isNotBlank() } ?: rawErr.ifBlank { "HTTP $code error" }
+        return AiFailureClassifier.sanitizeDetail(chosen)
     }
 
     internal fun parseResponsesJson(
@@ -338,6 +355,7 @@ class OpenAiCompatibleProviderAdapter(
     private fun parseResponsesSseStream(
         response: Response,
         fallbackModel: String,
+        modelId: String,
         request: UnifiedAiRequest,
         startMs: Long,
         onTextDelta: (String) -> Unit
@@ -481,15 +499,27 @@ class OpenAiCompatibleProviderAdapter(
                         }
                     }
                     "response.failed", "error" -> {
-                        val errMsg = (obj["error"] as? JsonObject)?.get("message")?.jsonPrimitive?.contentOrNull
-                            ?: (obj["response"] as? JsonObject)?.let { it["error"] as? JsonObject }?.get("message")?.jsonPrimitive?.contentOrNull
+                        val errObj = (obj["error"] as? JsonObject)
+                            ?: (obj["response"] as? JsonObject)?.let { it["error"] as? JsonObject }
+                        val errCode = errObj?.get("code")?.jsonPrimitive?.contentOrNull?.lowercase().orEmpty()
+                        val errMsg = errObj?.get("message")?.jsonPrimitive?.contentOrNull
                             ?: "OpenAI Responses stream reported an error."
+                        val lower = errMsg.lowercase()
+                        val (mappedCat, mappedStatus) = when {
+                            errCode.contains("rate_limit") || lower.contains("rate limit") ->
+                                AiFailureCategory.RATE_LIMIT_429 to 429
+                            errCode.contains("insufficient_quota") || lower.contains("quota") ->
+                                AiFailureCategory.PAYMENT_OR_QUOTA to 402
+                            errCode.contains("invalid_api_key") || lower.contains("api key") ->
+                                AiFailureCategory.AUTH_OR_KEY_ERROR to 401
+                            else -> AiFailureCategory.SERVER_ERROR_5XX to 502
+                        }
                         throw AiProviderException(
-                            category = AiFailureCategory.SERVER_ERROR_5XX,
-                            statusCode = 502,
+                            category = mappedCat,
+                            statusCode = mappedStatus,
                             providerId = providerType.name,
-                            modelId = request.requestId,
-                            message = errMsg
+                            modelId = modelId,
+                            message = AiFailureClassifier.sanitizeDetail(errMsg)
                         )
                     }
                 }
@@ -526,7 +556,7 @@ class OpenAiCompatibleProviderAdapter(
             promptTokensEstimate = promptEst.coerceAtLeast(16),
             completionTokensEstimate = (finalText.length / 4).coerceAtLeast(if (toolCalls.isNotEmpty()) 16 else 0),
             ttftMs = if (ttftMs > 0L) ttftMs else (System.currentTimeMillis() - startMs).coerceAtLeast(1L),
-            streamInterrupted = !completedNormally && finalText.isBlank() && toolCalls.isEmpty(),
+            streamInterrupted = !completedNormally && toolCalls.isEmpty(),
             openAiResponseId = responseId
         )
     }
@@ -603,13 +633,16 @@ class AnthropicCompatibleProviderAdapter(
                                         in 500..599 -> AiFailureCategory.SERVER_ERROR_5XX
                                         else -> AiFailureCategory.UNKNOWN
                                     }
+                                    val retryAfterSeconds = res.header("Retry-After")?.trim()?.toDoubleOrNull()
                                     val ex = AiProviderException(
                                         category = category,
                                         statusCode = res.code,
-                                        retryAfterMs = res.header("Retry-After")?.toLongOrNull()?.times(1000L),
+                                        retryAfterMs = retryAfterSeconds
+                                            ?.takeIf { it.isFinite() && it > 0.0 }
+                                            ?.let { (it * 1000.0).toLong().coerceIn(500L, 120_000L) },
                                         providerId = providerType.name,
                                         modelId = config.modelId,
-                                        message = "Anthropic endpoint HTTP ${res.code}: ${raw.take(160)}"
+                                        message = "Anthropic endpoint HTTP ${res.code}: ${AiFailureClassifier.sanitizeDetail(raw)}"
                                     )
                                     if (!cont.isCompleted) cont.resumeWithException(ex)
                                     return

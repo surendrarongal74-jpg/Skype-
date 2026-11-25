@@ -769,6 +769,25 @@ class AlloraCriticalRepairsTest {
         assertEquals(1, cloudRepo.savedUserMessageCount.get())
     }
 
+    @Test
+    fun `appCheck debug token from launch intent is persisted synchronously before provider factory install`() {
+        val expectedToken = "debug-token-${UUID.randomUUID()}"
+        val launchIntent = android.content.Intent().apply {
+            putExtra("FIREBASE_APPCHECK_DEBUG_TOKEN", expectedToken)
+        }
+        com.example.core.configureAppCheck(appContext, launchIntent)
+
+        val persistenceKey = FirebaseApp.getInstance().persistenceKey
+        val prefs = appContext.getSharedPreferences(
+            "com.google.firebase.appcheck.debug.store.$persistenceKey",
+            Context.MODE_PRIVATE
+        )
+        assertEquals(
+            expectedToken,
+            prefs.getString("com.google.firebase.appcheck.debug.DEBUG_SECRET", null)
+        )
+    }
+
     private fun createSdkThoughtTextPart(text: String): TextPart {
         val ctor = TextPart::class.java.declaredConstructors.firstOrNull { c ->
             val p = c.parameterTypes

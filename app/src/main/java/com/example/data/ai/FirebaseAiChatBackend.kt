@@ -607,7 +607,18 @@ class FirebaseAiChatBackend(
                 .firstOrNull()?.message?.takeIf { it.isNotBlank() }?.let { alreadyFriendly ->
                     return ConversationSerializer.sanitizeUserFacingErrorText(alreadyFriendly)
                 }
+            val providerEx = chain.filterIsInstance<com.example.data.ai.orchestrator.AiProviderException>().firstOrNull()
             val combinedMessages = chain.mapNotNull { it.message?.lowercase() }.joinToString(" | ")
+
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.AUTH_EXPIRED ||
+                combinedMessages.contains("user-token-expired") ||
+                combinedMessages.contains("token expired") ||
+                combinedMessages.contains("id token expired") ||
+                combinedMessages.contains("session expired") ||
+                combinedMessages.contains("must be signed in")
+            ) {
+                return "Authentication failure: Your Firebase session expired. Please sign in again and tap Retry."
+            }
 
             if (ConversationSerializer.isRoleCompatibilityErrorMessage(combinedMessages) ||
                 combinedMessages.contains("invalid_request")
@@ -615,14 +626,16 @@ class FirebaseAiChatBackend(
                 return "Could not format the conversation history for $modelId. Please tap Retry."
             }
 
-            if (chain.any { it is TimeoutCancellationException || it is SocketTimeoutException } ||
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.TIMEOUT ||
+                chain.any { it is TimeoutCancellationException || it is SocketTimeoutException } ||
                 combinedMessages.contains("timed out") ||
                 combinedMessages.contains("timeout")
             ) {
                 return "Request timed out. Check your connection and tap Retry."
             }
 
-            if (chain.any {
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.NETWORK_ERROR ||
+                chain.any {
                     it is UnknownHostException ||
                         it is ConnectException ||
                         it is NoRouteToHostException ||
@@ -630,6 +643,8 @@ class FirebaseAiChatBackend(
                         it is FirebaseNetworkException
                 } ||
                 combinedMessages.contains("unable to resolve host") ||
+                combinedMessages.contains("no active internet connection") ||
+                combinedMessages.contains("no internet connection") ||
                 combinedMessages.contains("network error") ||
                 combinedMessages.contains("failed to connect") ||
                 combinedMessages.contains("no address associated")
@@ -643,29 +658,41 @@ class FirebaseAiChatBackend(
                 return "No internet connection. Check your network and tap Retry."
             }
 
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.STREAM_INTERRUPTED ||
+                (combinedMessages.contains("stream") && (combinedMessages.contains("interrupt") || combinedMessages.contains("closed")))
+            ) {
+                return "Temporary network failure: The AI response stream was interrupted. Please tap Retry."
+            }
+
             if (combinedMessages.contains("app check") ||
                 combinedMessages.contains("appcheck") ||
                 combinedMessages.contains("attestation") ||
                 combinedMessages.contains("403") ||
                 combinedMessages.contains("401") ||
                 combinedMessages.contains("unauthenticated") ||
+                combinedMessages.contains("unauthorized") ||
                 combinedMessages.contains("permission denied") ||
-                combinedMessages.contains("api key")
+                combinedMessages.contains("api key") ||
+                providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.AUTH_OR_KEY_ERROR
             ) {
                 return "Authentication or App Check verification error. Verify Firebase Auth/App Check and tap Retry."
             }
 
-            if (combinedMessages.contains("model") &&
-                (combinedMessages.contains("not found") ||
-                    combinedMessages.contains("not enabled") ||
-                    combinedMessages.contains("unsupported") ||
-                    combinedMessages.contains("404") ||
-                    combinedMessages.contains("deprecated"))
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.MODEL_NOT_FOUND ||
+                (combinedMessages.contains("model") &&
+                    (combinedMessages.contains("not found") ||
+                        combinedMessages.contains("not enabled") ||
+                        combinedMessages.contains("unsupported") ||
+                        combinedMessages.contains("404") ||
+                        combinedMessages.contains("deprecated")))
             ) {
                 return "AI model ($modelId) is not enabled or unavailable for this project."
             }
 
-            if (combinedMessages.contains("429") ||
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.RATE_LIMIT_429 ||
+                providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.PAYMENT_OR_QUOTA ||
+                combinedMessages.contains("429") ||
+                combinedMessages.contains("rate limit") ||
                 combinedMessages.contains("quota") ||
                 combinedMessages.contains("resource exhausted")
             ) {
@@ -686,20 +713,25 @@ class FirebaseAiChatBackend(
                 return "Empty AI response received. Tap Retry to try again."
             }
 
-            if (combinedMessages.contains("503") ||
+            if (providerEx?.category == com.example.data.ai.orchestrator.AiFailureCategory.SERVER_ERROR_5XX ||
+                combinedMessages.contains("503") ||
+                combinedMessages.contains("502") ||
                 combinedMessages.contains("500") ||
+                combinedMessages.contains("overloaded") ||
                 combinedMessages.contains("unavailable")
             ) {
-                return "AI service is currently unavailable. Please tap Retry."
+                return "Provider unavailable: The AI provider is temporarily overloaded or unavailable. Please tap Retry."
             }
 
             val rawDetail = chain.asReversed()
                 .mapNotNull { it.localizedMessage?.trim() }
                 .firstOrNull { it.isNotBlank() }
                 .orEmpty()
-            val cleaned = ConversationSerializer.stripAiServiceErrorPrefixes(rawDetail)
+            val cleaned = com.example.data.ai.orchestrator.AiFailureClassifier.sanitizeDetail(
+                ConversationSerializer.stripAiServiceErrorPrefixes(rawDetail)
+            )
             return if (cleaned.isNotBlank()) {
-                "AI service error: ${cleaned.take(160)}"
+                "AI service error: $cleaned"
             } else {
                 "Unable to get an AI response right now. Tap Retry."
             }

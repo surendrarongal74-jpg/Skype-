@@ -62,35 +62,29 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.addOutline
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
-import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.Placeable
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -98,7 +92,6 @@ import com.example.ui.theme.AlloraGlassColors
 import com.example.ui.theme.ElectricBlue
 import com.example.ui.theme.GlassMaterial
 import com.example.ui.theme.LocalAlloraGlassColors
-import kotlin.math.roundToInt
 
 object GlassTokens {
     val PanelRadius = 26.dp
@@ -261,40 +254,17 @@ fun GlassSurface(
     borderWidth: Dp = 0.85.dp,
     overrideSurfaceBrush: Brush? = null,
     overrideBorderBrush: Brush? = null,
-    enableBackdropBlur: Boolean = true,
+    @Suppress("UNUSED_PARAMETER") enableBackdropBlur: Boolean = true,
     contentAlignment: Alignment = Alignment.TopStart,
     content: @Composable BoxScope.() -> Unit
 ) {
     val glass = LocalAlloraGlassColors.current
-    val backdrop = LocalGlassBackdrop.current
-    val useRealTimeBlur = enableBackdropBlur &&
-        material != GlassMaterial.PEARL &&
-        role != GlassSurfaceRole.MODAL &&
-        role.blurRadius > 0.dp &&
-        backdrop.activeLayer != null &&
-        (role == GlassSurfaceRole.NAV ||
-            (backdrop.liveContentLayer != null && backdrop.activeLayer === backdrop.liveContentLayer))
-
-    val blurredSliceLayer = if (useRealTimeBlur) rememberGraphicsLayer() else null
-    val rootTopLeftRef = remember { GlassOffsetRef(Offset.Unspecified) }
-    val blurRecordCache = remember {
-        object {
-            var width: Int = -1
-            var height: Int = -1
-            var dx: Int = Int.MIN_VALUE
-            var dy: Int = Int.MIN_VALUE
-            var isDark: Boolean = glass.isDark
-            var layer: androidx.compose.ui.graphics.layer.GraphicsLayer? = null
-        }
+    val surfaceBrush = remember(overrideSurfaceBrush, role, material, glass) {
+        overrideSurfaceBrush ?: resolveGlassRoleBrush(role, material, glass)
     }
-    val density = androidx.compose.ui.platform.LocalDensity.current
-    val blurPx = with(density) { role.blurRadius.toPx() }
-    val cachedBlurEffect = remember(useRealTimeBlur, blurPx.roundToInt()) {
-        if (useRealTimeBlur && blurPx > 0.5f) createPlatformBlurEffect(blurPx) else null
+    val borderBrush = remember(overrideBorderBrush, material, glass, accentBorder) {
+        overrideBorderBrush ?: resolveGlassBorderBrush(material, glass, accentBorder)
     }
-
-    val surfaceBrush = overrideSurfaceBrush ?: resolveGlassRoleBrush(role, material, glass)
-    val borderBrush = overrideBorderBrush ?: resolveGlassBorderBrush(material, glass, accentBorder)
 
     val sheenAlpha = when {
         material == GlassMaterial.PEARL -> 0f
@@ -323,111 +293,66 @@ fun GlassSurface(
         role == GlassSurfaceRole.NAV || role == GlassSurfaceRole.MODAL -> 0.08f
         else -> 0.045f
     }
+    val shadowColor = glass.ambientShadow.copy(alpha = shadowAlpha)
 
     Box(
         modifier = modifier
-            .then(
-                if (useRealTimeBlur) {
-                    Modifier.onGloballyPositioned { coords ->
-                        if (coords.isAttached) {
-                            rootTopLeftRef.offset = coords.positionInRoot()
-                        }
-                    }
-                } else {
-                    Modifier
+            .drawWithCache {
+                if (size.width < 1f || size.height < 1f) {
+                    return@drawWithCache onDrawBehind { }
                 }
-            )
-            .drawBehind {
-                if (size.width < 1f || size.height < 1f) return@drawBehind
                 val outline = shape.createOutline(size, layoutDirection, this)
-                val outlinePath = androidx.compose.ui.graphics.Path().apply { addOutline(outline) }
-
-                // 1. Delicate perimeter ambient shadow
+                val outlinePath = Path().apply { addOutline(outline) }
                 val spreadPx = 1.8.dp.toPx()
-                val shadowOffset = Offset(0f, spreadPx * 0.8f)
-                translate(shadowOffset.x, shadowOffset.y) {
-                    drawPath(
-                        path = outlinePath,
-                        color = glass.ambientShadow.copy(alpha = shadowAlpha),
-                        style = Stroke(width = 2.6.dp.toPx())
+                val shadowOffsetY = spreadPx * 0.8f
+                val shadowStroke = Stroke(width = 2.6.dp.toPx())
+                val sheenBrush = if (sheenAlpha > 0f) {
+                    Brush.linearGradient(
+                        0.0f to Color.Transparent,
+                        0.24f to Color.White.copy(alpha = sheenAlpha * 0.45f),
+                        0.42f to Color.White.copy(alpha = sheenAlpha),
+                        0.64f to Color.Transparent,
+                        start = Offset(0f, 0f),
+                        end = Offset(size.width, size.height)
                     )
+                } else {
+                    null
                 }
+                val innerGlowBrush = if (innerGlowAlpha > 0f) {
+                    Brush.verticalGradient(
+                        0.0f to Color.White.copy(alpha = innerGlowAlpha),
+                        0.28f to Color.Transparent
+                    )
+                } else {
+                    null
+                }
+                val innerStroke = Stroke(width = 1.6.dp.toPx())
 
-                // 2. Clipped real backdrop blur + translucent glass surface + diagonal reflection sheen
-                clipPath(outlinePath) {
-                    val activeBackdropLayer = backdrop.activeLayer
-                    val activeOrigin = backdrop.activeOriginRef.offset
-                    val rootTopLeft = rootTopLeftRef.offset
-
-                    if (blurredSliceLayer != null &&
-                        cachedBlurEffect != null &&
-                        activeBackdropLayer != null &&
-                        activeBackdropLayer.size.width > 0 &&
-                        activeBackdropLayer.size.height > 0 &&
-                        rootTopLeft.isSpecified &&
-                        rootTopLeft.x.isFinite() &&
-                        rootTopLeft.y.isFinite()
-                    ) {
-                        val intSize = IntSize(
-                            width = size.width.roundToInt().coerceAtLeast(1),
-                            height = size.height.roundToInt().coerceAtLeast(1)
-                        )
-                        val dx = rootTopLeft.x - activeOrigin.x
-                        val dy = rootTopLeft.y - activeOrigin.y
-                        val dxInt = dx.roundToInt()
-                        val dyInt = dy.roundToInt()
-                        if (blurRecordCache.width != intSize.width ||
-                            blurRecordCache.height != intSize.height ||
-                            blurRecordCache.dx != dxInt ||
-                            blurRecordCache.dy != dyInt ||
-                            blurRecordCache.isDark != glass.isDark ||
-                            blurRecordCache.layer !== activeBackdropLayer
-                        ) {
-                            blurRecordCache.width = intSize.width
-                            blurRecordCache.height = intSize.height
-                            blurRecordCache.dx = dxInt
-                            blurRecordCache.dy = dyInt
-                            blurRecordCache.isDark = glass.isDark
-                            blurRecordCache.layer = activeBackdropLayer
-                            blurredSliceLayer.renderEffect = cachedBlurEffect
-                            blurredSliceLayer.record(size = intSize) {
-                                clipRect(0f, 0f, size.width, size.height) {
-                                    translate(-dx, -dy) {
-                                        drawLayer(activeBackdropLayer)
-                                    }
-                                }
-                            }
-                        }
-                        drawLayer(blurredSliceLayer)
-                    }
-
-                    // 3. Low-opacity frosted surface wash
-                    drawRect(brush = surfaceBrush)
-
-                    // 4. Subtle 135° diagonal glass reflection sheen
-                    if (sheenAlpha > 0f) {
-                        drawRect(
-                            brush = Brush.linearGradient(
-                                0.0f to Color.Transparent,
-                                0.24f to Color.White.copy(alpha = sheenAlpha * 0.45f),
-                                0.42f to Color.White.copy(alpha = sheenAlpha),
-                                0.64f to Color.Transparent,
-                                start = Offset(0f, 0f),
-                                end = Offset(size.width, size.height)
-                            )
-                        )
-                    }
-
-                    // 5. Crisp top-edge inner specular highlight
-                    if (innerGlowAlpha > 0f) {
+                onDrawBehind {
+                    // 1. Delicate perimeter ambient shadow
+                    translate(0f, shadowOffsetY) {
                         drawPath(
                             path = outlinePath,
-                            brush = Brush.verticalGradient(
-                                0.0f to Color.White.copy(alpha = innerGlowAlpha),
-                                0.28f to Color.Transparent
-                            ),
-                            style = Stroke(width = 1.6.dp.toPx())
+                            color = shadowColor,
+                            style = shadowStroke
                         )
+                    }
+
+                    // 2. Clipped translucent glass surface + diagonal reflection sheen + inner highlight
+                    clipPath(outlinePath) {
+                        drawRect(brush = surfaceBrush)
+
+                        if (sheenBrush != null) {
+                            drawRect(brush = sheenBrush)
+                        }
+
+                        if (innerGlowBrush != null) {
+                            drawPath(
+                                path = outlinePath,
+                                brush = innerGlowBrush,
+                                style = innerStroke
+                            )
+                        }
                     }
                 }
             }

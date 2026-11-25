@@ -2,6 +2,8 @@ package com.example.data.ai
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.example.data.ai.orchestrator.AiFailureClassifier
+import com.example.data.ai.orchestrator.AiProviderException
 import com.example.data.ai.orchestrator.AiRequestManager
 import com.example.data.ai.orchestrator.AiStatusPhase
 import com.example.data.ai.orchestrator.AiTaskProfile
@@ -64,7 +66,9 @@ class AlloraAiService(
     private val geminiBackend: GeminiChatBackend = FirebaseAiChatBackend(),
     private val unifiedToolRouter: AlloraUnifiedToolRouter? = null,
     private val aiRequestManager: AiRequestManager? = null,
-    private val dynamicContextProvider: (suspend () -> String)? = null
+    private val dynamicContextProvider: (suspend () -> String)? = null,
+    private val userIdProvider: () -> String = { "default" },
+    private val authTokenValidator: (suspend (String) -> Unit)? = null
 ) {
 
     private val resolvedRequestManager: AiRequestManager by lazy {
@@ -167,9 +171,11 @@ class AlloraAiService(
         var lastCreatedTripId: String? = null
 
         return try {
+            val activeUserId = userIdProvider().ifBlank { "default" }
             val effectiveSystemPrompt = buildContextualSystemPrompt(assistantSystemPrompt)
             val finalText: String
             if (usesCustomTestGeminiBackend) {
+                authTokenValidator?.invoke(activeUserId)
                 val res = geminiBackend.streamPlainAssistantChat(
                     systemPrompt = effectiveSystemPrompt,
                     prompt = prompt,
@@ -183,6 +189,7 @@ class AlloraAiService(
                 finalText = res.text.trim()
             } else {
                 val orchestrated = resolvedRequestManager.runChatTurn(
+                    userId = activeUserId,
                     taskProfile = AiTaskProfile.SIMPLE_CHAT,
                     systemPrompt = effectiveSystemPrompt,
                     userPrompt = prompt,
@@ -222,7 +229,7 @@ class AlloraAiService(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            runCatching { Log.e(TAG, "AI assistant orchestration failed", e) }
+            runCatching { Log.e(TAG, formatDiagnosticError("AI assistant orchestration failed", e)) }
             val friendly = resolvedRequestManager.classifyUserFriendlyError(e, activeModelId)
             Result.failure(ClassifiedAiException(friendly, e))
         }
@@ -278,10 +285,12 @@ class AlloraAiService(
         var lastCreatedTripId: String? = null
 
         return try {
+            val activeUserId = userIdProvider().ifBlank { "default" }
             onTaskStep("Thinking with Allora...")
             val effectiveStructuredPrompt = buildContextualSystemPrompt(structuredSystemPrompt)
             val raw: String
             if (usesCustomTestGeminiBackend) {
+                authTokenValidator?.invoke(activeUserId)
                 val res = geminiBackend.streamStructuredChat(
                     systemPrompt = effectiveStructuredPrompt,
                     userPrompt = userPromptFull,
@@ -304,6 +313,7 @@ class AlloraAiService(
                     else -> AiTaskProfile.SIMPLE_CHAT
                 }
                 val orchestrated = resolvedRequestManager.runChatTurn(
+                    userId = activeUserId,
                     taskProfile = taskProfile,
                     systemPrompt = effectiveStructuredPrompt,
                     userPrompt = userPromptFull,
@@ -373,7 +383,7 @@ class AlloraAiService(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            runCatching { Log.e(TAG, "Structured chat failed", e) }
+            runCatching { Log.e(TAG, formatDiagnosticError("Structured chat failed", e)) }
             val friendly = resolvedRequestManager.classifyUserFriendlyError(e, activeModelId)
             Result.failure(ClassifiedAiException(friendly, e))
         }
@@ -820,13 +830,16 @@ class AlloraAiService(
             Return 5 to 6 crisp chronological itinerary stops across days 1 to 3 with realistic estimated costs and practical logistics notes.
         """.trimIndent()
 
+        val activeUserId = userIdProvider().ifBlank { "default" }
         val rawJson = if (usesCustomTestGeminiBackend) {
+            authTokenValidator?.invoke(activeUserId)
             geminiBackend.generateStructuredItineraryJson(
                 systemPrompt = "You are ALLORA's precision itinerary planner. Return strictly valid JSON adhering to the requested schema.",
                 prompt = prompt
             ).trim()
         } else {
             val response = resolvedRequestManager.generateStructuredJson(
+                userId = activeUserId,
                 taskProfile = AiTaskProfile.STRUCTURED_JSON,
                 systemPrompt = "You are ALLORA's precision itinerary planner. Return strictly valid JSON adhering to the requested schema.",
                 prompt = prompt,
@@ -866,9 +879,22 @@ class AlloraAiService(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        runCatching { Log.e(TAG, "Itinerary generation failed", e) }
+        runCatching { Log.e(TAG, formatDiagnosticError("Itinerary generation failed", e)) }
         val friendly = resolvedRequestManager.classifyUserFriendlyError(e, activeModelId)
         Result.failure(ClassifiedAiException(friendly, e))
+    }
+
+    private fun formatDiagnosticError(prefix: String, error: Throwable): String {
+        val providerEx = generateSequence(error) { it.cause }
+            .filterIsInstance<AiProviderException>()
+            .firstOrNull()
+        return if (providerEx != null) {
+            val sanitized = AiFailureClassifier.sanitizeDetail(providerEx.message, 140)
+            "$prefix (${error::class.java.simpleName} category=${providerEx.category} status=${providerEx.statusCode} model=${providerEx.modelId}): $sanitized"
+        } else {
+            val sanitized = AiFailureClassifier.sanitizeDetail(error.message.orEmpty(), 140)
+            "$prefix (${error::class.java.simpleName}): $sanitized"
+        }
     }
 
     private fun humanReadableToolLabel(toolName: String): String = when (toolName) {

@@ -539,4 +539,290 @@ class AiModelOrchestratorTest {
         assertEquals("backup_openai", response.diagnostics.selectedModelId)
         assertEquals(1, openAiHealthy.callCount.get())
     }
+
+    @Test
+    fun `app check 403 on Gemini triggers failover to real OpenAI MockWebServer backup endpoint`() = runBlocking {
+        val server = okhttp3.mockwebserver.MockWebServer()
+        server.start()
+        try {
+            val sseBody = buildString {
+                append("event: response.output_text.delta\n")
+                append("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello from OpenAI backup!\"}\n\n")
+                append("event: response.completed\n")
+                append("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"usage\":{\"input_tokens\":22,\"output_tokens\":8}}}\n\n")
+            }
+            server.enqueue(
+                okhttp3.mockwebserver.MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(sseBody)
+            )
+
+            val models = listOf(
+                testModels()[0],
+                testModels()[2].copy(endpointUrl = server.url("/v1/responses").toString())
+            )
+            val appCheckFailingGemini = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+                throw IllegalStateException("Firebase App Check attestation failed (403 permission denied)")
+            }
+            val realOpenAiAdapter = OpenAiCompatibleProviderAdapter(
+                apiKeyResolver = { "test-openai-runtime-key" }
+            )
+
+            val orchestrator = AiModelOrchestrator(
+                registry = AiModelRegistry(models),
+                healthMonitor = ModelHealthMonitor(),
+                adapters = mapOf(
+                    AiProviderType.FIREBASE_AI to appCheckFailingGemini,
+                    AiProviderType.OPENAI_COMPATIBLE to realOpenAiAdapter
+                ),
+                sleepFn = {}
+            )
+
+            val result = orchestrator.executeTurn(
+                snapshot = TurnContextSnapshot(
+                    requestId = "req_mock_openai",
+                    userId = "uid_user_a",
+                    systemPrompt = "You are ALLORA.",
+                    historyPairs = emptyList(),
+                    userPrompt = "Hello"
+                ),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT
+            )
+
+            assertEquals("Hello from OpenAI backup!", result.text)
+            assertEquals("backup_openai", result.diagnostics.selectedModelId)
+            val recordedReq = server.takeRequest()
+            assertEquals("/v1/responses", recordedReq.path)
+            assertTrue(recordedReq.getHeader("Authorization") == "Bearer test-openai-runtime-key")
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `truncated OpenAI SSE stream without response completed is rejected`() = runBlocking {
+        val server = okhttp3.mockwebserver.MockWebServer()
+        server.start()
+        try {
+            val truncatedSse = buildString {
+                append("event: response.output_text.delta\n")
+                append("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial answer\"}\n\n")
+            }
+            repeat(2) {
+                server.enqueue(
+                    okhttp3.mockwebserver.MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(truncatedSse)
+                )
+            }
+
+            val openAiOnly = listOf(
+                testModels()[2].copy(endpointUrl = server.url("/v1/responses").toString())
+            )
+            val orchestrator = AiModelOrchestrator(
+                registry = AiModelRegistry(openAiOnly),
+                healthMonitor = ModelHealthMonitor(),
+                adapters = mapOf(
+                    AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                        apiKeyResolver = { "test-openai-runtime-key" }
+                    )
+                ),
+                sleepFn = {}
+            )
+
+            val err = runCatching {
+                orchestrator.executeTurn(
+                    snapshot = TurnContextSnapshot("req_trunc", "u1", "sys", emptyList(), "Hello"),
+                    taskProfile = AiTaskProfile.SIMPLE_CHAT
+                )
+            }.exceptionOrNull() as? AiProviderException
+
+            assertNotNull(err)
+            assertEquals(AiFailureCategory.STREAM_INTERRUPTED, err?.category)
+            assertEquals(AlloraChatInterfaceState.TEMPORARY_NETWORK_FAILURE, AiFailureClassifier.classifyInterfaceState(err!!))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `both providers unavailable classifies as PROVIDER_UNAVAILABLE`() = runBlocking {
+        val server = okhttp3.mockwebserver.MockWebServer()
+        server.start()
+        try {
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setResponseCode(502).setBody("""{"error":{"message":"Bad gateway"}}"""))
+            val models = listOf(
+                testModels()[0],
+                testModels()[2].copy(endpointUrl = server.url("/v1/responses").toString())
+            )
+            val gemini503 = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+                throw AiProviderException(
+                    category = AiFailureCategory.SERVER_ERROR_5XX,
+                    statusCode = 503,
+                    providerId = "FIREBASE_AI",
+                    modelId = "primary_firebase",
+                    message = "Service overloaded"
+                )
+            }
+            val orchestrator = AiModelOrchestrator(
+                registry = AiModelRegistry(models),
+                healthMonitor = ModelHealthMonitor(),
+                adapters = mapOf(
+                    AiProviderType.FIREBASE_AI to gemini503,
+                    AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                        apiKeyResolver = { "test-openai-runtime-key" }
+                    )
+                ),
+                sleepFn = {}
+            )
+
+            val err = runCatching {
+                orchestrator.executeTurn(
+                    snapshot = TurnContextSnapshot("req_both_down", "u1", "sys", emptyList(), "Hello"),
+                    taskProfile = AiTaskProfile.SIMPLE_CHAT
+                )
+            }.exceptionOrNull()
+
+            assertNotNull(err)
+            assertEquals(AlloraChatInterfaceState.PROVIDER_UNAVAILABLE, AiFailureClassifier.classifyInterfaceState(err!!))
+            assertTrue(
+                com.example.data.ai.FirebaseAiChatBackend.classifyAiErrorMessage(err)
+                    .contains("Provider unavailable", ignoreCase = true)
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `offline connectivity precheck skips providers and recovers on reconnect`() = runBlocking {
+        var isOnline = false
+        val gemini = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+            UnifiedAiResponse(text = "Back online and ready!")
+        }
+        val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(listOf(testModels()[0])),
+            healthMonitor = ModelHealthMonitor(),
+            adapters = mapOf(AiProviderType.FIREBASE_AI to gemini),
+            sleepFn = {},
+            isNetworkAvailable = { isOnline }
+        )
+
+        val offlineErr = runCatching {
+            orchestrator.executeTurn(
+                snapshot = TurnContextSnapshot("req_off", "u1", "sys", emptyList(), "Hello"),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT
+            )
+        }.exceptionOrNull() as? AiProviderException
+
+        assertNotNull(offlineErr)
+        assertEquals(AiFailureCategory.NETWORK_ERROR, offlineErr?.category)
+        assertEquals(0, gemini.callCount.get())
+        assertEquals(AlloraChatInterfaceState.TEMPORARY_NETWORK_FAILURE, AiFailureClassifier.classifyInterfaceState(offlineErr!!))
+
+        // Reconnect and send again
+        isOnline = true
+        val ok = orchestrator.executeTurn(
+            snapshot = TurnContextSnapshot("req_on", "u1", "sys", emptyList(), "Hello"),
+            taskProfile = AiTaskProfile.SIMPLE_CHAT
+        )
+        assertEquals("Back online and ready!", ok.text)
+        assertEquals(1, gemini.callCount.get())
+    }
+
+    @Test
+    fun `expired Firebase authentication fails immediately without calling providers or consuming quota`() = runBlocking {
+        val gemini = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+            UnifiedAiResponse(text = "Should never run")
+        }
+        val openAi = ScriptedAdapter(AiProviderType.OPENAI_COMPATIBLE) { _, _, _ ->
+            UnifiedAiResponse(text = "Should never run")
+        }
+        val limiter = AiUsageLimiter(dailyRequestLimit = 5, monthlyRequestLimit = 20)
+        val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(listOf(testModels()[0], testModels()[2])),
+            healthMonitor = ModelHealthMonitor(),
+            adapters = mapOf(
+                AiProviderType.FIREBASE_AI to gemini,
+                AiProviderType.OPENAI_COMPATIBLE to openAi
+            ),
+            usageLimiter = limiter,
+            sleepFn = {},
+            authTokenValidator = {
+                throw IllegalStateException("Firebase ID token expired. Please sign in again.")
+            }
+        )
+
+        val authErr = runCatching {
+            orchestrator.executeTurn(
+                snapshot = TurnContextSnapshot("req_auth", "u1", "sys", emptyList(), "Hello"),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT
+            )
+        }.exceptionOrNull() as? AiProviderException
+
+        assertNotNull(authErr)
+        assertEquals(AiFailureCategory.AUTH_EXPIRED, authErr?.category)
+        assertEquals(0, gemini.callCount.get())
+        assertEquals(0, openAi.callCount.get())
+        assertEquals(0, limiter.activeQuota.value.dailyRequestsUsed)
+        assertEquals(AlloraChatInterfaceState.AUTHENTICATION_FAILURE, AiFailureClassifier.classifyInterfaceState(authErr!!))
+    }
+
+    @Test
+    fun `rate limiting isolates per-user quotas and classifies HTTP 429 Retry-After as RATE_LIMITED`() = runBlocking {
+        val limiter = AiUsageLimiter(dailyRequestLimit = 1, monthlyRequestLimit = 5)
+        limiter.checkAndConsumeRequest("uid_alice")
+        val aliceBlocked = runCatching { limiter.checkAndConsumeRequest("uid_alice") }.exceptionOrNull() as? AiProviderException
+        assertEquals(AiFailureCategory.RATE_LIMIT_429, aliceBlocked?.category)
+        assertEquals(AlloraChatInterfaceState.RATE_LIMITED, AiFailureClassifier.classifyInterfaceState(aliceBlocked!!))
+
+        // Different Firebase user still has full quota
+        limiter.checkAndConsumeRequest("uid_bob")
+
+        val server = okhttp3.mockwebserver.MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                okhttp3.mockwebserver.MockResponse()
+                    .setResponseCode(429)
+                    .setHeader("Retry-After", "0")
+                    .setBody("""{"error":{"message":"Rate limit exceeded for sk-secret1234567890"}}""")
+            )
+            server.enqueue(
+                okhttp3.mockwebserver.MockResponse()
+                    .setResponseCode(429)
+                    .setHeader("Retry-After", "2")
+                    .setBody("""{"error":{"message":"Rate limit exceeded"}}""")
+            )
+            val openAiOnly = listOf(
+                testModels()[2].copy(endpointUrl = server.url("/v1/responses").toString())
+            )
+            val orchestrator = AiModelOrchestrator(
+                registry = AiModelRegistry(openAiOnly),
+                healthMonitor = ModelHealthMonitor(),
+                adapters = mapOf(
+                    AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                        apiKeyResolver = { "test-openai-runtime-key" }
+                    )
+                ),
+                sleepFn = {}
+            )
+
+            val rateErr = runCatching {
+                orchestrator.executeTurn(
+                    snapshot = TurnContextSnapshot("req_429", "uid_bob", "sys", emptyList(), "Hello"),
+                    taskProfile = AiTaskProfile.SIMPLE_CHAT
+                )
+            }.exceptionOrNull() as? AiProviderException
+
+            assertNotNull(rateErr)
+            assertEquals(AiFailureCategory.RATE_LIMIT_429, rateErr?.category)
+            assertFalse(rateErr?.message?.contains("sk-secret") == true)
+            assertEquals(AlloraChatInterfaceState.RATE_LIMITED, AiFailureClassifier.classifyInterfaceState(rateErr!!))
+        } finally {
+            server.shutdown()
+        }
+    }
 }

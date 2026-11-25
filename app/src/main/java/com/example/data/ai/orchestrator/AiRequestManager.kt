@@ -249,6 +249,16 @@ class AiRequestManager(
         return FirebaseAiChatBackend.classifyAiErrorMessage(error, modelLabel)
     }
 
+    fun classifyInterfaceState(error: Throwable): AlloraChatInterfaceState =
+        AiFailureClassifier.classifyInterfaceState(error)
+
+    fun configureRuntimeHooks(
+        networkCheck: (() -> Boolean)? = null,
+        authValidator: (suspend (String) -> Unit)? = null
+    ) {
+        orchestrator.configureRuntimeHooks(networkCheck = networkCheck, authValidator = authValidator)
+    }
+
     fun updateUserPreferences(prefs: AiUserPreferences) {
         orchestrator.updateUserPreferences(prefs)
     }

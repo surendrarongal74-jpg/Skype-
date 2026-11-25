@@ -14,6 +14,7 @@ import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.auth.FirebaseUser
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,6 +23,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 
 data class AlloraAuthUser(
@@ -258,7 +261,9 @@ class AuthSessionViewModel(
                 return@launch
             }
 
-            val uxPrefs = appearanceStore.sessionUxPrefsFlow.first()
+            val uxPrefs = withContext(Dispatchers.IO) {
+                appearanceStore.sessionUxPrefsFlow.first()
+            }
             if (uxPrefs.signedOutExplicitly) {
                 startupRestoreCompleted = true
                 _sessionState.value = AlloraAuthSessionState.Unauthenticated(
@@ -269,7 +274,9 @@ class AuthSessionViewModel(
             }
 
             val restored = if (context != null) {
-                authGateway.attemptSilentGoogleRestore(context)
+                withTimeoutOrNull(2_500L) {
+                    authGateway.attemptSilentGoogleRestore(context)
+                }
             } else {
                 null
             }
@@ -293,7 +300,7 @@ class AuthSessionViewModel(
             return
         }
         verifiedUidForSession = user.uid
-        when (val result = authGateway.verifySessionOnline(user)) {
+        when (val result = withContext(Dispatchers.IO) { authGateway.verifySessionOnline(user) }) {
             is SessionValidationResult.Valid,
             is SessionValidationResult.TransientNetworkError -> Unit
             is SessionValidationResult.Invalidated -> {

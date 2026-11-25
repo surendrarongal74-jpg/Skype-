@@ -110,6 +110,7 @@ enum class AiFailureCategory(
     STREAM_INTERRUPTED("Stream Interrupted", true, true),
     INVALID_RESPONSE("Invalid Response", true, true),
     INVALID_REQUEST("Request Format Error", false, false),
+    AUTH_EXPIRED("Authentication Expired", false, false),
     PERMISSION_DENIED("Permission Denied", false, false),
     TOOL_CALL_UNSUPPORTED("Tool Failure", true, false),
     SAFETY_BLOCKED("Safety Blocked", false, false),
@@ -213,6 +214,18 @@ enum class AiStatusPhase(val subtleMessage: String) {
     CONTINUING_TASK("Continuing your task..."),
     UNAVAILABLE("AI temporarily unavailable."),
     ERROR("AI temporarily unavailable.")
+}
+
+enum class AlloraChatInterfaceState(val displayLabel: String) {
+    IDLE("Ready"),
+    SENDING("Sending"),
+    THINKING("Thinking"),
+    RECEIVING_RESPONSE("Receiving response"),
+    SUCCESS("Success"),
+    TEMPORARY_NETWORK_FAILURE("Temporary network failure"),
+    AUTHENTICATION_FAILURE("Authentication failure"),
+    PROVIDER_UNAVAILABLE("Provider unavailable"),
+    RATE_LIMITED("Rate limited")
 }
 
 data class AiFailoverEvent(

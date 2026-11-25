@@ -25,6 +25,7 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
@@ -32,10 +33,13 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -60,6 +64,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 enum class OrbState {
@@ -291,6 +296,7 @@ internal fun rememberAlloraOrbSpringDriver(
 
     LaunchedEffect(reducedMotion) {
         if (reducedMotion) return@LaunchedEffect
+        withFrameNanos { }
         var lastFrameNanos = AnimationConstants.UnspecifiedTime
         val twoPi = (2.0 * PI).toFloat()
         while (isActive) {
@@ -567,6 +573,52 @@ fun AlloraAiOrb(
                     val eyeCenterY = center.y - unit * 0.05f
                     val mouthY = center.y + unit * 0.22f
 
+                    val widthPx = this.size.width.roundToInt().coerceAtLeast(1)
+                    val heightPx = this.size.height.roundToInt().coerceAtLeast(1)
+                    val cachedCloudBodyBitmap = ImageBitmap(widthPx, heightPx).also { bitmap ->
+                        val canvas = Canvas(bitmap)
+                        CanvasDrawScope().draw(
+                            density = this,
+                            layoutDirection = layoutDirection,
+                            canvas = canvas,
+                            size = this.size
+                        ) {
+                            lobes.forEach { lobe ->
+                                val lobeCenter = Offset(center.x + unit * lobe.dx, center.y + unit * lobe.dy)
+                                val lobeRadius = unit * lobe.r
+                                drawCircle(
+                                    color = Color.White.copy(alpha = if (isDark) 0.26f else 0.78f),
+                                    radius = lobeRadius + (unit * 0.028f),
+                                    center = lobeCenter
+                                )
+                            }
+                            lobes.forEach { lobe ->
+                                val lobeCenter = Offset(center.x + unit * lobe.dx, center.y + unit * lobe.dy)
+                                val lobeRadius = unit * lobe.r
+                                drawCircle(
+                                    brush = volumeBrush,
+                                    radius = lobeRadius,
+                                    center = lobeCenter
+                                )
+                                drawCircle(
+                                    brush = leftMintHighlightBrush,
+                                    radius = lobeRadius,
+                                    center = lobeCenter
+                                )
+                                drawCircle(
+                                    brush = bottomBounceBrush,
+                                    radius = lobeRadius,
+                                    center = lobeCenter
+                                )
+                            }
+                            drawCircle(
+                                brush = crownGlintBrush,
+                                radius = unit * 0.42f,
+                                center = Offset(center.x - unit * 0.16f, center.y - unit * 0.48f)
+                            )
+                        }
+                    }
+
                     onDrawBehind {
                         val effectiveAngle = if (reducedMotion) 25f else driver.orbitalAngleAnim.value
                         val clockSec = if (reducedMotion) 0f else driver.clockSecondsAnim.value
@@ -611,42 +663,8 @@ fun AlloraAiOrb(
                             }
                         }
 
-                        // 4. Fluffy multi-lobed cloud rim glow + main pastel cloud lobes
-                        lobes.forEach { lobe ->
-                            val lobeCenter = Offset(center.x + unit * lobe.dx, center.y + unit * lobe.dy)
-                            val lobeRadius = unit * lobe.r
-                            drawCircle(
-                                color = Color.White.copy(alpha = if (isDark) 0.26f else 0.78f),
-                                radius = lobeRadius + (unit * 0.028f),
-                                center = lobeCenter
-                            )
-                        }
-                        lobes.forEach { lobe ->
-                            val lobeCenter = Offset(center.x + unit * lobe.dx, center.y + unit * lobe.dy)
-                            val lobeRadius = unit * lobe.r
-                            drawCircle(
-                                brush = volumeBrush,
-                                radius = lobeRadius,
-                                center = lobeCenter
-                            )
-                            drawCircle(
-                                brush = leftMintHighlightBrush,
-                                radius = lobeRadius,
-                                center = lobeCenter
-                            )
-                            drawCircle(
-                                brush = bottomBounceBrush,
-                                radius = lobeRadius,
-                                center = lobeCenter
-                            )
-                        }
-
-                        // 5. Upper cloud crown highlight
-                        drawCircle(
-                            brush = crownGlintBrush,
-                            radius = unit * 0.42f,
-                            center = Offset(center.x - unit * 0.16f, center.y - unit * 0.48f)
-                        )
+                        // 4 & 5. Pre-rendered multi-lobed pastel cloud silhouette + upper crown highlight
+                        drawImage(cachedCloudBodyBitmap)
 
                         // 6. Ambient pastel sparkles around the cloud
                         if (drawDetails && state != OrbState.OFFLINE) {

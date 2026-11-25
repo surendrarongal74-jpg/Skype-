@@ -24,6 +24,7 @@ import com.example.data.ai.orchestrator.AiStatusPhase
 import com.example.data.ai.orchestrator.AiTaskProfile
 import com.example.data.ai.orchestrator.AiTelemetrySink
 import com.example.data.ai.orchestrator.AiUserPreferences
+import com.example.data.ai.orchestrator.AlloraChatInterfaceState
 import com.example.data.ai.orchestrator.ConversationSerializer
 import com.example.data.ai.orchestrator.ManualModelUnavailableException
 import com.example.data.local.AlloraChatLocalStore
@@ -222,7 +223,8 @@ class AlloraViewModel(
     private val workspaceController: AlloraAgentWorkspaceController? = null,
     private val preloadedChatThreads: List<com.example.ui.chat.AlloraChatThread>? = null,
     private val preloadedActiveThreadId: String? = null,
-    private val aiRequestManager: AiRequestManager = AiRequestManager.getInstance()
+    private val aiRequestManager: AiRequestManager = AiRequestManager.getInstance(),
+    private val preloadedThreadsAlreadyRepaired: Boolean = false
 ) : ViewModel() {
 
     val auditItems: StateFlow<List<RepoAuditItem>> = localRepo.auditItems
@@ -395,6 +397,12 @@ class AlloraViewModel(
 
     private val _aiChatState = MutableStateFlow(AiChatState.IDLE)
     val aiChatState: StateFlow<AiChatState> = _aiChatState.asStateFlow()
+
+    private val _chatInterfaceState = MutableStateFlow(AlloraChatInterfaceState.IDLE)
+    val chatInterfaceState: StateFlow<AlloraChatInterfaceState> = _chatInterfaceState.asStateFlow()
+
+    private val _lastChatErrorCategory = MutableStateFlow<AlloraChatInterfaceState?>(null)
+    val lastChatErrorCategory: StateFlow<AlloraChatInterfaceState?> = _lastChatErrorCategory.asStateFlow()
 
     private val _aiStatusLabel = MutableStateFlow("Ready • Allora Gemini AI")
     val aiStatusLabel: StateFlow<String> = _aiStatusLabel.asStateFlow()
@@ -606,6 +614,8 @@ class AlloraViewModel(
     private val recentSubmissionTimestampsMs = LinkedHashMap<String, Long>()
     private val _isSendingMessage = MutableStateFlow(false)
     val isSendingMessage: StateFlow<Boolean> = _isSendingMessage.asStateFlow()
+    private val _isRetryingMessage = MutableStateFlow(false)
+    val isRetryingMessage: StateFlow<Boolean> = _isRetryingMessage.asStateFlow()
     private var itineraryObserverJob: Job? = null
     private val firestoreObserverJobs = mutableListOf<Job>()
     private var hasLoadedServerProfile = false
@@ -616,14 +626,17 @@ class AlloraViewModel(
         loadPersistedRichThreads()
         observeAppearancePreferences()
         loadInitialRoomPreferences()
-        startFirestoreObservers()
-        attachAiOrchestratorTelemetryAndSync()
         observeLocationTracker()
         viewModelScope.launch {
-            taskEngine?.bindUser(currentUserId)
+            kotlinx.coroutines.yield()
+            startFirestoreObservers()
+            attachAiOrchestratorTelemetryAndSync()
+            withContext(Dispatchers.IO) {
+                taskEngine?.bindUser(currentUserId)
+            }
         }
         viewModelScope.launch {
-            delay(250L)
+            delay(450L)
             loadWeatherForFeaturedCities()
             refreshNearbyPois(35.6762, 139.6503, "All")
         }
@@ -1333,6 +1346,8 @@ class AlloraViewModel(
             list.map { if (it.isStreaming) it.copy(isStreaming = false) else it } + userMsg + placeholderMsg
         }
         _aiChatState.value = AiChatState.SENDING
+        _chatInterfaceState.value = AlloraChatInterfaceState.SENDING
+        _lastChatErrorCategory.value = null
         _orbState.value = OrbState.PROCESSING
         _aiStatusLabel.value = "Thinking with Allora..."
 
@@ -1347,11 +1362,12 @@ class AlloraViewModel(
                         AiMessageDoc(id = userMsg.id, userId = currentUserId, isUser = true, text = trimmed)
                     )
                 }.onFailure { err ->
-                    Log.w(TAG, "Background user message cloud sync skipped", err)
+                    Log.w(TAG, "Background user message cloud sync skipped (${err::class.java.simpleName})")
                 }
             }
 
             _aiChatState.value = AiChatState.THINKING
+            _chatInterfaceState.value = AlloraChatInterfaceState.THINKING
             try {
                 val result = aiService.sendAssistantWithTools(
                     prompt = trimmed,
@@ -1361,6 +1377,7 @@ class AlloraViewModel(
                     },
                     onStreamChunk = { delta ->
                         _aiChatState.value = AiChatState.STREAMING
+                        _chatInterfaceState.value = AlloraChatInterfaceState.RECEIVING_RESPONSE
                         _aiStatusLabel.value = "Allora is replying..."
                         _chatMessages.update { list ->
                             list.map { msg ->
@@ -1383,6 +1400,8 @@ class AlloraViewModel(
                 result.fold(
                     onSuccess = { reply ->
                         _aiChatState.value = AiChatState.COMPLETED
+                        _chatInterfaceState.value = AlloraChatInterfaceState.SUCCESS
+                        _lastChatErrorCategory.value = null
                         _chatMessages.update { list ->
                             list.map { msg ->
                                 if (msg.id == assistantMsgId) {
@@ -1421,6 +1440,13 @@ class AlloraViewModel(
                         _orbState.value = OrbState.IDLE
                         _aiStatusLabel.value = "Ready • Allora Gemini AI"
                         _aiChatState.value = AiChatState.IDLE
+                        viewModelScope.launch {
+                            delay(600L)
+                            _chatInterfaceState.compareAndSet(
+                                AlloraChatInterfaceState.SUCCESS,
+                                AlloraChatInterfaceState.IDLE
+                            )
+                        }
                     },
                     onFailure = { e ->
                         if (e is CancellationException) throw e
@@ -1429,9 +1455,12 @@ class AlloraViewModel(
                         if (manualEx != null) {
                             _manualModeBlockedNotice.value = manualEx
                         }
+                        val interfaceErrState = aiRequestManager.classifyInterfaceState(e)
                         _aiChatState.value = AiChatState.ERROR
+                        _chatInterfaceState.value = interfaceErrState
+                        _lastChatErrorCategory.value = interfaceErrState
                         _orbState.value = OrbState.ERROR
-                        _aiStatusLabel.value = "AI request failed"
+                        _aiStatusLabel.value = interfaceErrState.displayLabel
                         val friendlyError = aiRequestManager.classifyUserFriendlyError(e)
                             .ifBlank { "Unable to reach ALLORA AI right now. Tap Retry." }
                         _chatMessages.update { list ->
@@ -1455,6 +1484,7 @@ class AlloraViewModel(
                 }
                 if (_aiChatState.value != AiChatState.ERROR) {
                     _aiChatState.value = AiChatState.IDLE
+                    _chatInterfaceState.value = AlloraChatInterfaceState.IDLE
                     _orbState.value = OrbState.IDLE
                     _aiStatusLabel.value = "Ready • Allora Gemini AI"
                 }
@@ -1469,8 +1499,12 @@ class AlloraViewModel(
 
     private fun loadPersistedRichThreads() {
         val rawThreads = preloadedChatThreads ?: chatLocalStore?.loadThreads().orEmpty()
-        val savedThreads = rawThreads.map { thread ->
-            thread.copy(messages = ConversationSerializer.repairRichMessages(thread.messages))
+        val savedThreads = if (preloadedThreadsAlreadyRepaired && preloadedChatThreads != null) {
+            rawThreads
+        } else {
+            rawThreads.map { thread ->
+                thread.copy(messages = ConversationSerializer.repairRichMessages(thread.messages))
+            }
         }
         if (savedThreads.isNotEmpty()) {
             _richThreads.value = savedThreads
@@ -2267,6 +2301,7 @@ class AlloraViewModel(
                 }
             }
             _isSendingMessage.value = true
+            _isRetryingMessage.value = false
         }
 
         val quote = explicitReplyTo?.let { target ->
@@ -2340,23 +2375,45 @@ class AlloraViewModel(
             historyPairs = historyPairs,
             quote = quote,
             attachments = attachments,
-            signature = signature
+            signature = signature,
+            isRetry = false
         )
     }
 
+    fun requestSessionReverification() {
+        onVerifySessionRequested?.invoke()
+    }
+
     fun retryRichChatMessage(failedAssistantMessageId: String) {
-        if (activeAiJob?.isActive == true && activeRichPlaceholderId == failedAssistantMessageId) {
-            return
+        synchronized(submissionLock) {
+            if (_isSendingMessage.value || _isRetryingMessage.value) {
+                return
+            }
+            if (activeAiJob?.isActive == true && activeRichPlaceholderId == failedAssistantMessageId) {
+                return
+            }
+            _isSendingMessage.value = true
+            _isRetryingMessage.value = true
         }
+
         val recorded = failedPromptsByAssistantId[failedAssistantMessageId]
         val targetThread = if (recorded != null) {
             _richThreads.value.firstOrNull { it.id == recorded.threadId }
         } else {
             _richThreads.value.firstOrNull { t -> t.messages.any { it.id == failedAssistantMessageId } }
-        } ?: return
+        }
+        if (targetThread == null) {
+            _isSendingMessage.value = false
+            _isRetryingMessage.value = false
+            return
+        }
 
         val failedIndex = targetThread.messages.indexOfFirst { it.id == failedAssistantMessageId }
-        if (failedIndex < 0) return
+        if (failedIndex < 0) {
+            _isSendingMessage.value = false
+            _isRetryingMessage.value = false
+            return
+        }
 
         val fallbackUserMsg = targetThread.messages
             .take(failedIndex)
@@ -2364,7 +2421,11 @@ class AlloraViewModel(
 
         val promptToRetry = recorded?.prompt
             ?: fallbackUserMsg?.plainText?.takeIf { it.isNotBlank() }
-            ?: return
+        if (promptToRetry == null) {
+            _isSendingMessage.value = false
+            _isRetryingMessage.value = false
+            return
+        }
         val attachmentsToRetry = recorded?.attachments ?: fallbackUserMsg?.attachments.orEmpty()
         val quoteToRetry = recorded?.replyTo ?: fallbackUserMsg?.replyTo
 
@@ -2379,7 +2440,7 @@ class AlloraViewModel(
         finalizeDanglingPlaceholder()
         activeAiJob?.cancel()
 
-        // Replace error bubble in-place with a fresh thinking placeholder (no duplicate user bubble)
+        // Replace error bubble in-place with a fresh retrying/thinking placeholder (no duplicate user bubble)
         _richThreads.update { threads ->
             threads.map { t ->
                 if (t.id != targetThread.id) t else t.copy(
@@ -2389,7 +2450,7 @@ class AlloraViewModel(
                             m.copy(
                                 plainText = "",
                                 blocks = emptyList(),
-                                timestampLabel = "Thinking",
+                                timestampLabel = "Retrying",
                                 isError = false,
                                 isStreaming = true
                             )
@@ -2398,16 +2459,18 @@ class AlloraViewModel(
                 )
             }
         }
+        persistRichThreadsNow()
 
         launchRichInference(
             tid = targetThread.id,
             assistantMsgId = failedAssistantMessageId,
-            userMsgIdToPersist = null,
+            userMsgIdToPersist = fallbackUserMsg?.id,
             promptToSend = promptToRetry,
             historyPairs = historyPairs,
             quote = quoteToRetry,
             attachments = attachmentsToRetry,
-            signature = "${targetThread.id}|retry|$failedAssistantMessageId"
+            signature = "${targetThread.id}|retry|$failedAssistantMessageId",
+            isRetry = true
         )
     }
 
@@ -2443,13 +2506,16 @@ class AlloraViewModel(
         historyPairs: List<Pair<Boolean, String>>,
         quote: AlloraReplyQuote?,
         attachments: List<ChatAttachment>,
-        signature: String
+        signature: String,
+        isRetry: Boolean = false
     ) {
         _aiChatState.value = AiChatState.SENDING
+        _chatInterfaceState.value = AlloraChatInterfaceState.SENDING
+        _lastChatErrorCategory.value = null
         _orbState.value = OrbState.PROCESSING
-        _aiStatusLabel.value = "Thinking with Allora..."
+        _aiStatusLabel.value = if (isRetry) "Retrying with Allora..." else "Thinking with Allora..."
         _chatTypingState.value = false
-        _chatLiveTaskStep.value = ""
+        _chatLiveTaskStep.value = if (isRetry) "Retrying..." else ""
         _manualModeBlockedNotice.value = null
 
         activePromptSignature = signature
@@ -2464,7 +2530,7 @@ class AlloraViewModel(
                 }
             }
 
-            // Persist user message to Firestore in background so offline/network lag never blocks AI inference
+            // Persist user message to Firestore in background (deterministic ID makes retry idempotent)
             if (userMsgIdToPersist != null) {
                 launch {
                     runCatching {
@@ -2472,12 +2538,13 @@ class AlloraViewModel(
                             AiMessageDoc(id = userMsgIdToPersist, userId = currentUserId, isUser = true, text = promptToSend)
                         )
                     }.onFailure { err ->
-                        Log.w(TAG, "Background user chat message cloud sync skipped", err)
+                        Log.w(TAG, "Background user chat message cloud sync skipped (${err::class.java.simpleName})")
                     }
                 }
             }
 
             _aiChatState.value = AiChatState.THINKING
+            _chatInterfaceState.value = AlloraChatInterfaceState.THINKING
 
             val bitmaps = if (attachments.any { it.isImage }) {
                 withContext(Dispatchers.IO) {
@@ -2530,6 +2597,7 @@ class AlloraViewModel(
                         typingDelayJob.cancel()
                         _chatTypingState.value = false
                         _aiChatState.value = AiChatState.STREAMING
+                        _chatInterfaceState.value = AlloraChatInterfaceState.RECEIVING_RESPONSE
                         _aiStatusLabel.value = "Allora is replying..."
                         _richThreads.update { threads ->
                             threads.map { t ->
@@ -2574,6 +2642,8 @@ class AlloraViewModel(
                     onSuccess = { reply ->
                         failedPromptsByAssistantId.remove(assistantMsgId)
                         _aiChatState.value = AiChatState.COMPLETED
+                        _chatInterfaceState.value = AlloraChatInterfaceState.SUCCESS
+                        _lastChatErrorCategory.value = null
                         val completedMsg = AlloraRichMessage(
                             id = assistantMsgId,
                             isUser = false,
@@ -2613,13 +2683,20 @@ class AlloraViewModel(
                                     )
                                 )
                             }.onFailure { err ->
-                                Log.w(TAG, "Background AI chat reply cloud sync skipped", err)
+                                Log.w(TAG, "Background AI chat reply cloud sync skipped (${err::class.java.simpleName})")
                             }
                         }
                         reply.createdTripId?.let { selectTrip(it) }
                         _orbState.value = OrbState.IDLE
                         _aiStatusLabel.value = "Ready • Allora Gemini AI"
                         _aiChatState.value = AiChatState.IDLE
+                        viewModelScope.launch {
+                            delay(600L)
+                            _chatInterfaceState.compareAndSet(
+                                AlloraChatInterfaceState.SUCCESS,
+                                AlloraChatInterfaceState.IDLE
+                            )
+                        }
                     },
                     onFailure = { e ->
                         if (e is CancellationException) throw e
@@ -2628,9 +2705,12 @@ class AlloraViewModel(
                         if (manualEx != null) {
                             _manualModeBlockedNotice.value = manualEx
                         }
+                        val interfaceErrState = aiRequestManager.classifyInterfaceState(e)
                         _aiChatState.value = AiChatState.ERROR
+                        _chatInterfaceState.value = interfaceErrState
+                        _lastChatErrorCategory.value = interfaceErrState
                         _orbState.value = OrbState.ERROR
-                        _aiStatusLabel.value = "Request failed"
+                        _aiStatusLabel.value = interfaceErrState.displayLabel
                         val errText = aiRequestManager.classifyUserFriendlyError(e)
                             .ifBlank { "Couldn't reach Allora right now. Tap Retry." }
                         failedPromptsByAssistantId[assistantMsgId] = FailedChatPrompt(
@@ -2667,6 +2747,7 @@ class AlloraViewModel(
                     _chatLiveTaskStep.value = ""
                     finalizeDanglingPlaceholder()
                     _aiChatState.value = AiChatState.IDLE
+                    _chatInterfaceState.value = AlloraChatInterfaceState.IDLE
                     _orbState.value = OrbState.IDLE
                     _aiStatusLabel.value = "Ready • Allora Gemini AI"
                 }
@@ -2679,6 +2760,7 @@ class AlloraViewModel(
                     activeRichThreadId = null
                 }
                 _isSendingMessage.value = false
+                _isRetryingMessage.value = false
             }
         }
     }
@@ -2689,7 +2771,11 @@ class AlloraViewModel(
         activeRichPlaceholderId = null
         activeRichThreadId = null
         failedPromptsByAssistantId.clear()
+        _isSendingMessage.value = false
+        _isRetryingMessage.value = false
         _aiChatState.value = AiChatState.IDLE
+        _chatInterfaceState.value = AlloraChatInterfaceState.IDLE
+        _lastChatErrorCategory.value = null
         _orbState.value = OrbState.IDLE
         _aiStatusLabel.value = "Ready • Allora Gemini AI"
         _chatTypingState.value = false

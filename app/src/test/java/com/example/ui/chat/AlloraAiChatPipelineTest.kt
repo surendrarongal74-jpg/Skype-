@@ -19,6 +19,20 @@ import com.example.data.ai.FirebaseAiChatBackend
 import com.example.data.ai.GeminiChatBackend
 import com.example.data.ai.GeminiStreamResult
 import com.example.data.ai.OpenRouterClient
+import com.example.data.ai.orchestrator.AiCapability
+import com.example.data.ai.orchestrator.AiFailureCategory
+import com.example.data.ai.orchestrator.AiModelConfig
+import com.example.data.ai.orchestrator.AiModelOrchestrator
+import com.example.data.ai.orchestrator.AiModelRegistry
+import com.example.data.ai.orchestrator.AiProviderAdapter
+import com.example.data.ai.orchestrator.AiProviderException
+import com.example.data.ai.orchestrator.AiProviderType
+import com.example.data.ai.orchestrator.AiRequestManager
+import com.example.data.ai.orchestrator.AlloraChatInterfaceState
+import com.example.data.ai.orchestrator.ModelHealthMonitor
+import com.example.data.ai.orchestrator.OpenAiCompatibleProviderAdapter
+import com.example.data.ai.orchestrator.UnifiedAiRequest
+import com.example.data.ai.orchestrator.UnifiedAiResponse
 import com.example.data.local.AlloraChatLocalStore
 import com.example.data.local.AlloraDatabase
 import com.example.data.remote.AiMessageDoc
@@ -37,11 +51,15 @@ import com.example.ui.viewmodel.AiChatState
 import com.example.ui.viewmodel.AlloraViewModel
 import com.google.firebase.FirebaseApp
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonElement
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -176,7 +194,10 @@ class AlloraAiChatPipelineTest {
         uid: String = "uid_chat_${UUID.randomUUID().toString().take(6)}",
         cloudRepo: FakeCloudRepository = FakeCloudRepository(),
         geminiBackend: ScriptedGeminiBackend = ScriptedGeminiBackend(),
-        clearLocalStore: Boolean = true
+        clearLocalStore: Boolean = true,
+        aiRequestManager: AiRequestManager? = null,
+        authTokenValidator: (suspend (String) -> Unit)? = null,
+        onVerifySessionRequested: (() -> Unit)? = null
     ): QuadHarness {
         val context = ApplicationProvider.getApplicationContext<Context>()
         if (FirebaseApp.getApps(context).isEmpty()) {
@@ -197,7 +218,10 @@ class AlloraAiChatPipelineTest {
             geospatialRepo = geoRepo,
             firestoreRepo = cloudRepo,
             openRouterClient = openRouter,
-            geminiBackend = geminiBackend
+            geminiBackend = geminiBackend,
+            aiRequestManager = aiRequestManager,
+            userIdProvider = { uid },
+            authTokenValidator = authTokenValidator
         )
         val store = androidx.lifecycle.ViewModelStore()
         val vm = androidx.lifecycle.ViewModelProvider(
@@ -214,7 +238,9 @@ class AlloraAiChatPipelineTest {
                         aiService = aiService,
                         currentUserId = uid,
                         initialDisplayName = "Sam",
-                        chatLocalStore = localStore
+                        chatLocalStore = localStore,
+                        onVerifySessionRequested = onVerifySessionRequested,
+                        aiRequestManager = aiRequestManager ?: AiRequestManager.getInstance()
                     ) as T
                 }
             }
@@ -627,6 +653,285 @@ class AlloraAiChatPipelineTest {
             release.complete(Unit)
             awaitChatSettled(harness.vm)
             assertEquals(1, harness.backend.recordedCalls.size)
+        } finally {
+            harness.cleanup()
+        }
+    }
+
+    @Test
+    fun `orchestrated pipeline fails over from Gemini to OpenAI backup and shows PROVIDER_UNAVAILABLE when both fail`() {
+        val server = MockWebServer()
+        server.start()
+        val sseBackup = buildString {
+            append("event: response.output_text.delta\n")
+            append("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello Sam from OpenAI backup!\"}\n\n")
+            append("event: response.completed\n")
+            append("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"usage\":{\"input_tokens\":10,\"output_tokens\":8}}}\n\n")
+        }
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(sseBackup)
+        )
+        // Second turn: OpenAI also fails with 503
+        server.enqueue(MockResponse().setResponseCode(503).setBody("""{"error":{"message":"OpenAI overloaded"}}"""))
+        server.enqueue(MockResponse().setResponseCode(503).setBody("""{"error":{"message":"OpenAI overloaded"}}"""))
+
+        val models = listOf(
+            AiModelConfig(
+                modelId = "primary_firebase",
+                displayName = "Gemini 3.8 Flash",
+                providerType = AiProviderType.FIREBASE_AI,
+                providerModelName = "gemini-3.8-flash",
+                tier = "Primary",
+                priority = 10,
+                contextWindowTokens = 1_000_000,
+                capabilities = setOf(AiCapability.CHAT, AiCapability.STREAMING, AiCapability.TOOL_CALLING, AiCapability.STRUCTURED_JSON),
+                speedRating = "Ultra-Fast"
+            ),
+            AiModelConfig(
+                modelId = "backup_openai",
+                displayName = "GPT-4o Mini",
+                providerType = AiProviderType.OPENAI_COMPATIBLE,
+                providerModelName = "gpt-4o-mini",
+                tier = "Backup",
+                priority = 30,
+                contextWindowTokens = 128_000,
+                capabilities = setOf(AiCapability.CHAT, AiCapability.STREAMING, AiCapability.TOOL_CALLING, AiCapability.STRUCTURED_JSON),
+                speedRating = "Fast",
+                endpointUrl = server.url("/v1/responses").toString()
+            )
+        )
+        val failingGeminiAdapter = object : AiProviderAdapter {
+            override val providerType = AiProviderType.FIREBASE_AI
+            override fun isConfiguredForModel(config: AiModelConfig) = true
+            override suspend fun execute(
+                config: AiModelConfig,
+                request: UnifiedAiRequest,
+                onTextDelta: (String) -> Unit
+            ): UnifiedAiResponse {
+                throw AiProviderException(
+                    category = AiFailureCategory.SERVER_ERROR_5XX,
+                    statusCode = 503,
+                    providerId = "FIREBASE_AI",
+                    modelId = config.modelId,
+                    message = "Gemini temporarily overloaded"
+                )
+            }
+        }
+        val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(models),
+            healthMonitor = ModelHealthMonitor(),
+            adapters = mapOf(
+                AiProviderType.FIREBASE_AI to failingGeminiAdapter,
+                AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                    apiKeyResolver = { "test-openai-runtime-key" }
+                )
+            ),
+            sleepFn = {}
+        )
+        val requestManager = AiRequestManager(orchestrator)
+        val harness = buildTestHarness(aiRequestManager = requestManager)
+        val observedStates = mutableListOf<AlloraChatInterfaceState>()
+        val scope = kotlinx.coroutines.CoroutineScope(Dispatchers.Main.immediate)
+        val collectorJob = scope.launch {
+            harness.vm.chatInterfaceState.collect { state ->
+                observedStates.add(state)
+            }
+        }
+
+        try {
+            composeRule.setContent {
+                AlloraTheme(darkTheme = false) {
+                    AlloraChatScreen(viewModel = harness.vm, onBack = {}, onNavigateSub = {})
+                }
+            }
+
+            // Scenario 4: Hello triggers Gemini -> OpenAI failover cleanly
+            composeRule.onNodeWithTag("composer_text_input").performTextInput("Hello")
+            composeRule.onNodeWithTag("composer_send_button").performClick()
+            awaitChatSettled(harness.vm)
+
+            composeRule.onNodeWithText("Hello Sam from OpenAI backup!").assertIsDisplayed()
+            assertTrue(observedStates.contains(AlloraChatInterfaceState.SENDING))
+            assertTrue(observedStates.contains(AlloraChatInterfaceState.THINKING))
+            assertTrue(observedStates.contains(AlloraChatInterfaceState.RECEIVING_RESPONSE))
+            assertTrue(observedStates.contains(AlloraChatInterfaceState.SUCCESS))
+
+            awaitCondition(2000L) {
+                harness.vm.chatInterfaceState.value == AlloraChatInterfaceState.IDLE
+            }
+
+            // Scenario 5: Both providers unavailable -> PROVIDER_UNAVAILABLE & non-stuck UI
+            composeRule.onNodeWithTag("composer_text_input").performTextInput("Second message")
+            composeRule.onNodeWithTag("composer_send_button").performClick()
+            awaitChatSettled(harness.vm)
+
+            assertEquals(AiChatState.ERROR, harness.vm.aiChatState.value)
+            assertEquals(AlloraChatInterfaceState.PROVIDER_UNAVAILABLE, harness.vm.chatInterfaceState.value)
+            assertFalse(harness.vm.chatTypingState.value)
+            composeRule.onNodeWithTag("chat_ai_status_pill").assertIsDisplayed()
+            composeRule.onNodeWithText("Provider unavailable").assertIsDisplayed()
+        } finally {
+            collectorJob.cancel()
+            harness.cleanup()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `expired Firebase auth renders AUTHENTICATION_FAILURE pill with Sign in again action and blocks provider call`() {
+        var reauthClicked = false
+        val harness = buildTestHarness(
+            authTokenValidator = {
+                throw IllegalStateException("Firebase ID token expired. Please sign in again.")
+            },
+            onVerifySessionRequested = { reauthClicked = true }
+        )
+        try {
+            composeRule.setContent {
+                AlloraTheme(darkTheme = false) {
+                    AlloraChatScreen(viewModel = harness.vm, onBack = {}, onNavigateSub = {})
+                }
+            }
+
+            composeRule.onNodeWithTag("composer_text_input").performTextInput("Check my account")
+            composeRule.onNodeWithTag("composer_send_button").performClick()
+            awaitChatSettled(harness.vm)
+
+            assertEquals(0, harness.backend.recordedCalls.size)
+            assertEquals(AiChatState.ERROR, harness.vm.aiChatState.value)
+            assertEquals(AlloraChatInterfaceState.AUTHENTICATION_FAILURE, harness.vm.chatInterfaceState.value)
+            assertFalse(harness.vm.chatTypingState.value)
+
+            composeRule.onNodeWithTag("chat_ai_status_pill").assertIsDisplayed()
+            composeRule.onNodeWithText("Authentication failure").assertIsDisplayed()
+            composeRule.onNodeWithTag("chat_reauth_action_button").assertIsDisplayed().performClick()
+            assertTrue(reauthClicked)
+        } finally {
+            harness.cleanup()
+        }
+    }
+
+    @Test
+    fun `rate limited response renders RATE_LIMITED pill without stuck spinner`() {
+        val harness = buildTestHarness()
+        harness.backend.handler = { _, _, _, _ ->
+            throw AiProviderException(
+                category = AiFailureCategory.RATE_LIMIT_429,
+                statusCode = 429,
+                providerId = "FIREBASE_AI",
+                modelId = "gemini-3.8-flash",
+                message = "429 Too Many Requests"
+            )
+        }
+        try {
+            composeRule.setContent {
+                AlloraTheme(darkTheme = false) {
+                    AlloraChatScreen(viewModel = harness.vm, onBack = {}, onNavigateSub = {})
+                }
+            }
+
+            composeRule.onNodeWithTag("composer_text_input").performTextInput("Summarize my week")
+            composeRule.onNodeWithTag("composer_send_button").performClick()
+            awaitChatSettled(harness.vm)
+
+            assertEquals(AiChatState.ERROR, harness.vm.aiChatState.value)
+            assertEquals(AlloraChatInterfaceState.RATE_LIMITED, harness.vm.chatInterfaceState.value)
+            assertFalse(harness.vm.chatTypingState.value)
+            composeRule.onNodeWithTag("chat_ai_status_pill").assertIsDisplayed()
+            composeRule.onNodeWithText("Rate limited").assertIsDisplayed()
+        } finally {
+            harness.cleanup()
+        }
+    }
+
+    @Test
+    fun `retry prevents duplicate requests, survives consecutive failure, and persists message on recovery`() {
+        val uid = "uid_retry_${UUID.randomUUID().toString().take(6)}"
+        val cloudRepo = FakeCloudRepository()
+        val gate = CompletableDeferred<Unit>()
+        var mode = "OFFLINE"
+
+        val harness = buildTestHarness(uid = uid, cloudRepo = cloudRepo)
+        harness.backend.handler = { prompt, _, _, onStreamText ->
+            when (mode) {
+                "OFFLINE" -> throw UnknownHostException("Unable to resolve host generativelanguage.googleapis.com")
+                "SERVER_FAIL" -> {
+                    gate.await()
+                    throw AiProviderException(
+                        category = AiFailureCategory.SERVER_ERROR_5XX,
+                        statusCode = 503,
+                        providerId = "FIREBASE_AI",
+                        modelId = "gemini-3.8-flash",
+                        message = "503 Provider unavailable"
+                    )
+                }
+                else -> {
+                    val reply = "Recovered reply for: $prompt"
+                    onStreamText(reply)
+                    GeminiStreamResult(
+                        text = """{ "blocks": [ { "type": "text", "content": "$reply" } ] }""",
+                        modelUsed = FirebaseAiChatBackend.DEFAULT_GEMINI_MODEL
+                    )
+                }
+            }
+        }
+
+        try {
+            composeRule.setContent {
+                AlloraTheme(darkTheme = false) {
+                    AlloraChatScreen(viewModel = harness.vm, onBack = {}, onNavigateSub = {})
+                }
+            }
+
+            // Initial offline send fails -> TEMPORARY_NETWORK_FAILURE
+            cloudRepo.failSaveAiMessageError = RuntimeException("Offline")
+            composeRule.onNodeWithTag("composer_text_input").performTextInput("Original travel question")
+            composeRule.onNodeWithTag("composer_send_button").performClick()
+            awaitChatSettled(harness.vm)
+
+            assertEquals(AlloraChatInterfaceState.TEMPORARY_NETWORK_FAILURE, harness.vm.chatInterfaceState.value)
+            val errMsg1 = harness.vm.richMessages.value.last()
+            assertTrue(errMsg1.isError)
+            assertEquals(0, cloudRepo.aiMessagesByUid.value[uid]?.size ?: 0)
+
+            // Retry #1 fails with 503 while verifying duplicate retry tap is ignored
+            mode = "SERVER_FAIL"
+            cloudRepo.failSaveAiMessageError = null
+            harness.vm.retryRichChatMessage(errMsg1.id)
+            harness.vm.retryRichChatMessage(errMsg1.id) // Duplicate tap while retry is active
+            awaitCondition(2000L) {
+                harness.backend.recordedCalls.size == 2 && harness.vm.isRetryingMessage.value
+            }
+            gate.complete(Unit)
+            awaitChatSettled(harness.vm)
+
+            // Duplicate call was blocked (still 2 total calls: initial + 1 retry)
+            assertEquals(2, harness.backend.recordedCalls.size)
+            assertEquals(AlloraChatInterfaceState.PROVIDER_UNAVAILABLE, harness.vm.chatInterfaceState.value)
+            assertFalse(harness.vm.isRetryingMessage.value)
+
+            // Original prompt & error bubble with Retry are still preserved for another Retry
+            val errMsg2 = harness.vm.richMessages.value.last()
+            assertTrue(errMsg2.isError)
+            composeRule.onNodeWithTag("allora_chat_list")
+                .performScrollToNode(hasTestTag("retry_ai_button_${errMsg2.id}"))
+            composeRule.onNodeWithTag("retry_ai_button_${errMsg2.id}").assertIsDisplayed()
+
+            // Retry #2 succeeds cleanly without duplicating the user bubble and syncs user + AI reply to cloud
+            mode = "OK"
+            composeRule.onNodeWithTag("retry_ai_button_${errMsg2.id}").performClick()
+            awaitChatSettled(harness.vm)
+
+            composeRule.onNodeWithText("Recovered reply for: Original travel question").assertIsDisplayed()
+            assertEquals(1, harness.vm.richMessages.value.count { it.isUser })
+            awaitCondition(2000L) {
+                val saved = cloudRepo.aiMessagesByUid.value[uid].orEmpty()
+                saved.any { it.isUser && it.text == "Original travel question" } &&
+                    saved.any { !it.isUser && it.text.contains("Recovered reply") }
+            }
         } finally {
             harness.cleanup()
         }

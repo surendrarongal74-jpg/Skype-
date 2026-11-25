@@ -633,6 +633,9 @@ class AlloraFirestoreRepository(
         )
         message.toolTraceSummary?.take(1000)?.let { payload["toolTraceSummary"] = it }
         try {
+            if (message.id.isNotBlank() && runCatching { docRef.get().await().exists() }.getOrDefault(false)) {
+                return@runCatching docId
+            }
             docRef.set(payload).await()
             docId
         } catch (e: CancellationException) {

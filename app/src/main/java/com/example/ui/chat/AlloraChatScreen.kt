@@ -78,9 +78,12 @@ import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.CheckCircleOutline
+import androidx.compose.material.icons.rounded.ErrorOutline
 import com.example.agent.AutonomousTaskRecord
 import com.example.data.ai.orchestrator.AiSelectionMode
 import com.example.data.ai.orchestrator.AiStatusPhase
+import com.example.data.ai.orchestrator.AlloraChatInterfaceState
 import com.example.data.ai.orchestrator.ManualModelUnavailableException
 import com.example.services.BrowserLiveActivityState
 import com.example.services.BrowserNavigationPhase
@@ -172,6 +175,8 @@ fun AlloraChatScreen(
     val pendingDomCommand by viewModel.pendingBrowserDomCommand.collectAsState()
     val autonomousTasks by viewModel.autonomousTasks.collectAsState()
     val aiStatusPhase by viewModel.aiStatusPhase.collectAsState()
+    val chatInterfaceState by viewModel.chatInterfaceState.collectAsState()
+    val isRetryingMessage by viewModel.isRetryingMessage.collectAsState()
     val activeAiModel by viewModel.activeAiModelConfig.collectAsState()
     val manualModeBlockedNotice by viewModel.manualModeBlockedNotice.collectAsState()
 
@@ -297,7 +302,10 @@ fun AlloraChatScreen(
             onEmailReply = { emailId -> viewModel.stageReplyOrForwardInChat(emailId, isForward = false) },
             onEmailForward = { emailId -> viewModel.stageReplyOrForwardInChat(emailId, isForward = true) },
             onEmailDelete = { emailId -> viewModel.stageDeleteConfirmationInChat(emailId) },
-            onExplainWalletTx = { txId -> viewModel.explainWalletTxInChat(txId) }
+            onExplainWalletTx = { txId -> viewModel.explainWalletTxInChat(txId) },
+            chatInterfaceState = chatInterfaceState,
+            isRetryingMessage = isRetryingMessage,
+            onVerifySessionRequested = { viewModel.requestSessionReverification() }
         )
     }
 }
@@ -352,7 +360,10 @@ fun AlloraChatContent(
     onEmailReply: (String) -> Unit = {},
     onEmailForward: (String) -> Unit = {},
     onEmailDelete: (String) -> Unit = {},
-    onExplainWalletTx: (String) -> Unit = {}
+    onExplainWalletTx: (String) -> Unit = {},
+    chatInterfaceState: AlloraChatInterfaceState = AlloraChatInterfaceState.IDLE,
+    isRetryingMessage: Boolean = false,
+    onVerifySessionRequested: () -> Unit = {}
 ) {
     val c = LocalAlloraChatColors.current
     val context = LocalContext.current
@@ -725,18 +736,20 @@ fun AlloraChatContent(
                                     }
                                 }
                                 val retryThisMessage: () -> Unit = {
-                                    val failedId = when (entry) {
-                                        is ChatListEntry.AssistantBlockRow -> entry.message.id
-                                        is ChatListEntry.AssistantStreamingRow -> entry.message.id
-                                        is ChatListEntry.UserRow -> entry.message.id
-                                        is ChatListEntry.DateDivider -> ""
-                                    }
-                                    if (onRetryMessage != null && failedId.isNotBlank()) {
-                                        onRetryMessage(failedId)
-                                    } else {
-                                        val lastUser = messages.lastOrNull { it.isUser }?.plainText
-                                        if (!lastUser.isNullOrBlank()) {
-                                            onSendPrompt(lastUser, emptyList())
+                                    if (!isRetryingMessage) {
+                                        val failedId = when (entry) {
+                                            is ChatListEntry.AssistantBlockRow -> entry.message.id
+                                            is ChatListEntry.AssistantStreamingRow -> entry.message.id
+                                            is ChatListEntry.UserRow -> entry.message.id
+                                            is ChatListEntry.DateDivider -> ""
+                                        }
+                                        if (onRetryMessage != null && failedId.isNotBlank()) {
+                                            onRetryMessage(failedId)
+                                        } else {
+                                            val lastUser = messages.lastOrNull { it.isUser }?.plainText
+                                            if (!lastUser.isNullOrBlank()) {
+                                                onSendPrompt(lastUser, emptyList())
+                                            }
                                         }
                                     }
                                 }
@@ -957,7 +970,14 @@ fun AlloraChatContent(
 
             // Subtle AI orchestrator status pill + separated Browser status pill + optional manual-mode fallback banner
             if (activeTab == AlloraTopTab.CHAT) {
-                val showAiPill = aiStatusPhase != AiStatusPhase.IDLE && aiStatusPhase != AiStatusPhase.GENERATING
+                val isErrorInterfaceState = chatInterfaceState == AlloraChatInterfaceState.TEMPORARY_NETWORK_FAILURE ||
+                    chatInterfaceState == AlloraChatInterfaceState.AUTHENTICATION_FAILURE ||
+                    chatInterfaceState == AlloraChatInterfaceState.PROVIDER_UNAVAILABLE ||
+                    chatInterfaceState == AlloraChatInterfaceState.RATE_LIMITED
+                val showAiPill = (aiStatusPhase != AiStatusPhase.IDLE && aiStatusPhase != AiStatusPhase.GENERATING) ||
+                    (chatInterfaceState != AlloraChatInterfaceState.IDLE &&
+                        chatInterfaceState != AlloraChatInterfaceState.RECEIVING_RESPONSE) ||
+                    isRetryingMessage
                 val showBrowserPill = browserLiveActivity.active &&
                     browserLiveActivity.browserPhase != BrowserNavigationPhase.IDLE &&
                     browserLiveActivity.browserPhase != BrowserNavigationPhase.DISCONNECTED
@@ -970,7 +990,8 @@ fun AlloraChatContent(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (showAiPill) {
                             Row(
@@ -983,19 +1004,40 @@ fun AlloraChatContent(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(12.dp),
-                                    strokeWidth = 1.6.dp,
-                                    color = c.accentBlue
-                                )
+                                when {
+                                    isErrorInterfaceState -> Icon(
+                                        imageVector = Icons.Rounded.ErrorOutline,
+                                        contentDescription = chatInterfaceState.displayLabel,
+                                        tint = Color(0xFFD9534F),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    chatInterfaceState == AlloraChatInterfaceState.SUCCESS -> Icon(
+                                        imageVector = Icons.Rounded.CheckCircleOutline,
+                                        contentDescription = "Success",
+                                        tint = Color(0xFF2E9D64),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    else -> CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp),
+                                        strokeWidth = 1.6.dp,
+                                        color = c.accentBlue
+                                    )
+                                }
                                 Text(
                                     text = buildString {
-                                        append(aiStatusPhase.subtleMessage)
-                                        if (!activeAiModelName.isNullOrBlank() &&
-                                            aiStatusPhase == AiStatusPhase.SWITCHING_MODEL
-                                        ) {
-                                            append(" • ")
-                                            append(activeAiModelName)
+                                        when {
+                                            isRetryingMessage -> append("Retrying request...")
+                                            isErrorInterfaceState -> append(chatInterfaceState.displayLabel)
+                                            chatInterfaceState == AlloraChatInterfaceState.SUCCESS -> append("Response ready")
+                                            aiStatusPhase == AiStatusPhase.SWITCHING_MODEL -> {
+                                                append(aiStatusPhase.subtleMessage)
+                                                if (!activeAiModelName.isNullOrBlank()) {
+                                                    append(" • ")
+                                                    append(activeAiModelName)
+                                                }
+                                            }
+                                            aiStatusPhase != AiStatusPhase.IDLE -> append(aiStatusPhase.subtleMessage)
+                                            else -> append(chatInterfaceState.displayLabel)
                                         }
                                     },
                                     style = MaterialTheme.typography.labelSmall.copy(
@@ -1005,6 +1047,24 @@ fun AlloraChatContent(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                if (chatInterfaceState == AlloraChatInterfaceState.AUTHENTICATION_FAILURE) {
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .background(c.accentBlue.copy(alpha = 0.14f))
+                                            .clickable(onClick = onVerifySessionRequested)
+                                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                                            .testTag("chat_reauth_action_button")
+                                    ) {
+                                        Text(
+                                            text = "Sign in again",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = c.accentBlue,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        )
+                                    }
+                                }
                             }
                         }
                         if (showBrowserPill) {

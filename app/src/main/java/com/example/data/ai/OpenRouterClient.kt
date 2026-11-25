@@ -219,7 +219,7 @@ class OpenRouterClient(
         } catch (te: TimeoutCancellationException) {
             throw te
         } catch (e: Exception) {
-            runCatching { Log.e(TAG, "OpenRouter request failed for model $model", e) }
+            runCatching { Log.e(TAG, "OpenRouter request failed for model $model (${e::class.java.simpleName})") }
             throw e
         }
     }
@@ -261,7 +261,7 @@ class OpenRouterClient(
         } catch (te: TimeoutCancellationException) {
             throw te
         } catch (e: Exception) {
-            runCatching { Log.e(TAG, "OpenRouter streaming failed for model $model", e) }
+            runCatching { Log.e(TAG, "OpenRouter streaming failed for model $model (${e::class.java.simpleName})") }
             throw e
         }
     }
@@ -646,16 +646,19 @@ class OpenRouterClient(
                 ?: obj["message"]?.jsonPrimitive?.contentOrNull
         }.getOrNull()
 
-        val retryAfterMs = retryAfterHeader?.trim()?.toLongOrNull()?.let { it.coerceIn(1L, 300L) * 1000L }
-        val category = classifyStatusCode(statusCode, parsedMsg ?: rawBody)
+        val cleanParsed = parsedMsg?.let { com.example.data.ai.orchestrator.AiFailureClassifier.sanitizeDetail(it) }
+        val retryAfterMs = retryAfterHeader?.trim()?.toDoubleOrNull()
+            ?.takeIf { it.isFinite() && it > 0.0 }
+            ?.let { (it * 1000.0).toLong().coerceIn(500L, 120_000L) }
+        val category = classifyStatusCode(statusCode, cleanParsed ?: rawBody)
         val message = when (statusCode) {
             401, 403 -> "Provider authentication failed ($statusCode). Verify API key configuration."
             402 -> "Provider credit limit reached (402)."
-            404 -> parsedMsg?.takeIf { it.isNotBlank() } ?: "Requested AI model not found (404)."
+            404 -> cleanParsed?.takeIf { it.isNotBlank() } ?: "Requested AI model not found (404)."
             429 -> "Provider rate limit hit (429)."
-            in 500..599 -> parsedMsg?.takeIf { it.isNotBlank() } ?: "Provider service error (HTTP $statusCode)."
-            else -> parsedMsg?.takeIf { it.isNotBlank() }
-                ?: "AI HTTP $statusCode: ${rawBody.take(180).ifBlank { "Request failed" }}"
+            in 500..599 -> cleanParsed?.takeIf { it.isNotBlank() } ?: "Provider service error (HTTP $statusCode)."
+            else -> cleanParsed?.takeIf { it.isNotBlank() }
+                ?: "AI HTTP $statusCode: ${com.example.data.ai.orchestrator.AiFailureClassifier.sanitizeDetail(rawBody).ifBlank { "Request failed" }}"
         }
         return AiProviderException(
             category = category,
