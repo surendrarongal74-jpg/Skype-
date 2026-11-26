@@ -25,8 +25,7 @@ data class EmailConnectionCloudRecord(
 )
 
 /**
- * Clean persistence port implemented by Firestore cloud store (`AlloraAgentCloudStore`).
- * Allows domain services to stay testable in unit tests while mirroring every mutation to Cloud Firestore.
+ * Persistence port for workspace services (Room remains the primary durable local store).
  */
 interface AgentCloudSyncPort {
     suspend fun syncWalletAccount(account: WalletAccountEntity) {}
@@ -47,3 +46,5 @@ interface AgentCloudSyncPort {
     suspend fun deleteProject(userId: String, projectId: String) {}
     suspend fun syncPersonalityProfile(profile: PersonalityProfileEntity) {}
 }
+
+object NoOpAgentCloudSyncPort : AgentCloudSyncPort

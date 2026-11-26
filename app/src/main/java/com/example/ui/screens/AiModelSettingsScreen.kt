@@ -158,13 +158,13 @@ fun AiModelSettingsScreen(
                     )
                 } else {
                     Text(
-                        text = "Orchestrator standing by. Primary: Gemini (Firebase AI Logic) • Backup: OpenAI with automatic context preservation.",
+                        text = "Orchestrator standing by. Primary: Groq GPT-OSS 120B • Fallback: Groq GPT-OSS 20B with automatic context preservation.",
                         style = MaterialTheme.typography.bodySmall.copy(color = glass.textSecondary)
                     )
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "Failover Policy: Context & conversation history are preserved when switching from Gemini to OpenAI on timeouts or rate limits. Invalid requests and permission denials never switch providers.",
+                    text = "Failover Policy: Context & conversation history are preserved when switching from Groq GPT-OSS 120B to Groq GPT-OSS 20B on timeouts or rate limits (HTTP 429). Invalid requests and permission denials never switch models.",
                     style = MaterialTheme.typography.labelSmall.copy(color = glass.textMuted)
                 )
             }

@@ -97,7 +97,7 @@ fun WorkspaceHubScreen(
             WorkspaceTileSpec("Email Workspace", "OAuth gated", Icons.Default.Email, SubDestination.PERSONAL_EMAIL),
             WorkspaceTileSpec("Autonomy Tiers", "3-level policy", Icons.Default.Shield, SubDestination.PERMISSION_CENTER),
             WorkspaceTileSpec("Security Audit", "Zero-trust log", Icons.Default.Security, SubDestination.SECURITY_CENTER),
-            WorkspaceTileSpec("AI Models", "Gemini + OpenAI", Icons.Default.AutoAwesome, SubDestination.AI_MODELS),
+            WorkspaceTileSpec("AI Models", "Groq GPT-OSS 120B", Icons.Default.AutoAwesome, SubDestination.AI_MODELS),
             WorkspaceTileSpec("ALLORA LIVE", "Voice & screen", Icons.Default.GraphicEq, SubDestination.LIVE_ASSISTANT)
         )
     }

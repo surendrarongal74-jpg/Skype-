@@ -5,6 +5,10 @@ import com.example.data.ai.OpenRouterSchemas
 import com.example.data.model.ToolExecutionTrace
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -821,6 +825,391 @@ class AiModelOrchestratorTest {
             assertEquals(AiFailureCategory.RATE_LIMIT_429, rateErr?.category)
             assertFalse(rateErr?.message?.contains("sk-secret") == true)
             assertEquals(AlloraChatInterfaceState.RATE_LIMITED, AiFailureClassifier.classifyInterfaceState(rateErr!!))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `openai backup authenticates to proxy via Firebase ID token and refuses direct api_openai_com without proxy`() = runBlocking {
+        val proxyAdapterWithoutUrl = OpenAiCompatibleProviderAdapter(
+            apiKeyResolver = { "" },
+            endpointResolver = { cfg -> cfg.endpointUrl },
+            firebaseIdTokenResolver = { "firebase-id-token-abc" }
+        )
+        val defaultOpenAiSeed = AiModelRegistry.defaultSeedModels()
+            .first { it.modelId == AiModelRegistry.ID_GROQ_GPT_OSS_120B }
+        assertFalse(
+            "Must NOT send Firebase ID token directly to api.groq.com when no proxy is configured",
+            proxyAdapterWithoutUrl.isConfiguredForModel(defaultOpenAiSeed)
+        )
+        assertTrue(
+            proxyAdapterWithoutUrl.diagnosticConfigStatus(defaultOpenAiSeed)
+                .contains("GROQ_PROXY_URL not set")
+        )
+
+        val server = okhttp3.mockwebserver.MockWebServer()
+        server.start()
+        try {
+            val sseBody = buildString {
+                append("event: response.output_text.delta\n")
+                append("data: {\"type\":\"response.output_text.delta\",\"delta\":\"OpenAI proxy reply via Firebase ID token!\"}\n\n")
+                append("event: response.completed\n")
+                append("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_proxy_1\"}}\n\n")
+            }
+            server.enqueue(
+                okhttp3.mockwebserver.MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(sseBody)
+            )
+
+            val geminiQuotaExceeded = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+                throw IllegalStateException("Quota exceeded: insufficient quota for project")
+            }
+            val proxyAdapter = OpenAiCompatibleProviderAdapter(
+                apiKeyResolver = { "" },
+                endpointResolver = { server.url("/openai-proxy/v1/responses").toString() },
+                firebaseIdTokenResolver = { "firebase-id-token-live-xyz" }
+            )
+
+            val orchestrator = AiModelOrchestrator(
+                registry = AiModelRegistry(listOf(testModels()[0], testModels()[2])),
+                healthMonitor = ModelHealthMonitor(),
+                adapters = mapOf(
+                    AiProviderType.FIREBASE_AI to geminiQuotaExceeded,
+                    AiProviderType.OPENAI_COMPATIBLE to proxyAdapter
+                ),
+                sleepFn = {}
+            )
+
+            val result = orchestrator.executeTurn(
+                snapshot = TurnContextSnapshot("req_proxy_fo", "uid_1", "sys", emptyList(), "Hello"),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT
+            )
+
+            assertEquals("OpenAI proxy reply via Firebase ID token!", result.text)
+            assertEquals("backup_openai", result.diagnostics.selectedModelId)
+            val recorded = server.takeRequest()
+            assertEquals("Bearer firebase-id-token-live-xyz", recorded.getHeader("Authorization"))
+            assertEquals("/openai-proxy/v1/responses", recorded.path)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `failure classifier and orchestrator preserve real failure causes instead of masking as Provider unavailable`() = runBlocking {
+        // 1. Model not enabled (even if message contains "unavailable") must NOT become SERVER_ERROR_5XX
+        val modelNotEnabled = AiFailureClassifier.toProviderException(
+            IllegalStateException("Model gemini-3.8-flash is unavailable or not enabled for this project"),
+            AiProviderType.FIREBASE_AI,
+            "firebase_gemini_3_8_flash"
+        )
+        assertEquals(AiFailureCategory.MODEL_NOT_FOUND, modelNotEnabled.category)
+        val modelMsg = com.example.data.ai.FirebaseAiChatBackend.classifyAiErrorMessage(modelNotEnabled, "Gemini 3.8 Flash")
+        assertFalse(modelMsg.startsWith("Provider unavailable:"))
+        assertTrue(modelMsg.contains("not enabled or unavailable", ignoreCase = true))
+
+        // 2. Multi-candidate failure: Primary fails with App Check 403, Secondary fails with Blaze billing, OpenAI proxy unconfigured
+        val primary403 = testModels()[0].copy(modelId = "firebase_gemini_3_8_flash", displayName = "Gemini 3.8 Flash", priority = 10)
+        val secondaryArgon = testModels()[0].copy(modelId = "firebase_gemini_4_argon", displayName = "Gemini 4 Argon", priority = 30)
+        val unconfiguredOpenAi = AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }
+
+        val geminiAdapter = ScriptedAdapter(AiProviderType.FIREBASE_AI) { cfg, _, _ ->
+            if (cfg.modelId == "firebase_gemini_3_8_flash") {
+                throw IllegalStateException("App Check attestation failed (HTTP 403)")
+            } else {
+                throw IllegalStateException("Firebase AI Logic requires Blaze billing upgrade for this model")
+            }
+        }
+        val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(listOf(primary403, secondaryArgon, unconfiguredOpenAi)),
+            healthMonitor = ModelHealthMonitor(),
+            adapters = mapOf(
+                AiProviderType.FIREBASE_AI to geminiAdapter,
+                AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                    apiKeyResolver = { "" },
+                    firebaseIdTokenResolver = { "firebase-id-token" }
+                )
+            ),
+            sleepFn = {}
+        )
+
+        val err = runCatching {
+            orchestrator.executeTurn(
+                snapshot = TurnContextSnapshot("req_preserve", "uid_1", "sys", emptyList(), "Hello"),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT
+            )
+        }.exceptionOrNull() as? AiProviderException
+
+        assertNotNull(err)
+        assertEquals(AiFailureCategory.AUTH_OR_KEY_ERROR, err?.category)
+        assertTrue(err?.message?.contains("App Check attestation failed") == true)
+        assertTrue(err?.message?.contains("Skipped:") == true)
+        val friendly = com.example.data.ai.FirebaseAiChatBackend.classifyAiErrorMessage(err!!)
+        assertFalse(friendly.startsWith("Provider unavailable:"))
+        assertTrue(friendly.contains("App Check", ignoreCase = true))
+    }
+
+    @Test
+    fun `explicit retry immediately probes open circuits and shared tool catalog has no empty object schemas`() = runBlocking {
+        // Verify zero tools declare empty OBJECT properties maps
+        com.example.data.ai.SharedToolCatalog.chatToolSpecs.forEach { spec ->
+            val props = spec.parametersSchema["properties"] as? kotlinx.serialization.json.JsonObject
+            assertTrue("Tool ${spec.name} must declare non-empty properties", props != null && props.isNotEmpty())
+        }
+
+        // Verify explicit isRetry = true probes OPEN circuits immediately after provider recovery
+        var healthy = false
+        val clockMs = java.util.concurrent.atomic.AtomicLong(1_000_000L)
+        val healthMonitor = ModelHealthMonitor(clockMs = { clockMs.get() })
+        val adapter = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+            if (!healthy) {
+                throw AiProviderException(
+                    category = AiFailureCategory.RATE_LIMIT_429,
+                    statusCode = 429,
+                    providerId = "FIREBASE_AI",
+                    modelId = "primary_firebase",
+                    message = "429 Too Many Requests"
+                )
+            }
+            UnifiedAiResponse(text = "Recovered on retry!")
+        }
+        val primary = testModels()[0]
+        val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(listOf(primary)),
+            healthMonitor = healthMonitor,
+            adapters = mapOf(AiProviderType.FIREBASE_AI to adapter),
+            clockMs = { clockMs.get() },
+            sleepFn = {}
+        )
+
+        val firstFail = runCatching {
+            orchestrator.executeTurn(
+                snapshot = TurnContextSnapshot("req_r1", "uid_1", "sys", emptyList(), "Hello"),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT,
+                isRetry = false
+            )
+        }
+        assertTrue(firstFail.isFailure)
+        assertEquals(CircuitState.OPEN, healthMonitor.getSnapshot(primary).circuitState)
+
+        healthy = true
+        val retryResult = orchestrator.executeTurn(
+            snapshot = TurnContextSnapshot("req_r2", "uid_1", "sys", emptyList(), "Hello"),
+            taskProfile = AiTaskProfile.SIMPLE_CHAT,
+            isRetry = true
+        )
+        assertEquals("Recovered on retry!", retryResult.text)
+        assertEquals(CircuitState.CLOSED, healthMonitor.getSnapshot(primary).circuitState)
+    }
+
+    @Test
+    fun `runtimeUserIdProvider resolves authenticated UID instead of default across authValidator and usageLimiter`() = runBlocking {
+        val validatedUids = mutableListOf<String>()
+        val adapter = ScriptedAdapter(AiProviderType.FIREBASE_AI) { _, _, _ ->
+            UnifiedAiResponse(
+                text = "Hello from ALLORA!",
+                promptTokensEstimate = 10,
+                completionTokensEstimate = 15
+            )
+        }
+        val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(listOf(testModels()[0])),
+            adapters = mapOf(AiProviderType.FIREBASE_AI to adapter),
+            sleepFn = {}
+        )
+        val manager = AiRequestManager(orchestrator)
+        manager.configureRuntimeHooks(
+            networkCheck = { true },
+            authValidator = { uid ->
+                validatedUids.add(uid)
+                if (uid == "default") throw IllegalStateException("default UID prohibited")
+            },
+            userIdProvider = { "firebase_uid_abc123" }
+        )
+
+        val result = manager.runChatTurn(
+            taskProfile = AiTaskProfile.SIMPLE_CHAT,
+            systemPrompt = "sys",
+            userPrompt = "Hello"
+        )
+
+        assertEquals("Hello from ALLORA!", result.text)
+        assertEquals(listOf("firebase_uid_abc123"), validatedUids)
+        assertEquals(1, orchestrator.usageLimiter.getSnapshotForUser("firebase_uid_abc123").dailyRequestsUsed)
+        assertEquals(0, orchestrator.usageLimiter.getSnapshotForUser("default").dailyRequestsUsed)
+    }
+
+    @Test
+    fun `firebasevertexai API blocked ServerException classifies as AUTH_OR_KEY_ERROR not SAFETY_BLOCKED`() {
+        val apiBlockedEx = IllegalStateException(
+            "Requests to this API firebasevertexai.googleapis.com method google.firebase.vertexai.v1beta.GenerativeService.StreamGenerateContent are blocked."
+        )
+        val classified = AiFailureClassifier.toProviderException(
+            apiBlockedEx,
+            AiProviderType.FIREBASE_AI,
+            "firebase_gemini_3_8_flash"
+        )
+        assertEquals(AiFailureCategory.AUTH_OR_KEY_ERROR, classified.category)
+        assertTrue(classified.category.shouldTriggerFailover)
+        assertEquals(AlloraChatInterfaceState.PROVIDER_UNAVAILABLE, AiFailureClassifier.classifyInterfaceState(classified))
+
+        val userMessage = com.example.data.ai.FirebaseAiChatBackend.classifyAiErrorMessage(
+            classified,
+            "Gemini 3.8 Flash"
+        )
+        assertFalse(userMessage.contains("safety policy", ignoreCase = true))
+        assertTrue(userMessage.contains("Firebase AI", ignoreCase = true))
+
+        val safetyEx = IllegalStateException("Candidate was blocked due to safety policy")
+        val classifiedSafety = AiFailureClassifier.toProviderException(
+            safetyEx,
+            AiProviderType.FIREBASE_AI,
+            "firebase_gemini_3_8_flash"
+        )
+        assertEquals(AiFailureCategory.SAFETY_BLOCKED, classifiedSafety.category)
+        assertFalse(classifiedSafety.category.shouldTriggerFailover)
+    }
+
+    @Test
+    fun `groq is default primary AI for preferences and all task profiles while google gemini is disabled`() {
+        val prefs = AiUserPreferences()
+        assertEquals(AiModelRegistry.ID_GROQ_GPT_OSS_120B, prefs.preferredModelId)
+        assertEquals(AiModelRegistry.ID_GROQ_GPT_OSS_120B, prefs.manualModelId)
+
+        val registry = AiModelRegistry()
+        val adapter = OpenAiCompatibleProviderAdapter(apiKeyResolver = { "gsk_test_groq_key_123" })
+        val router = IntelligentModelRouter(
+            registry = registry,
+            healthMonitor = ModelHealthMonitor(),
+            adapters = mapOf(
+                AiProviderType.FIREBASE_AI to FirebaseAiProviderAdapter(),
+                AiProviderType.OPENAI_COMPATIBLE to adapter
+            )
+        )
+
+        AiTaskProfile.entries.forEach { profile ->
+            val plan = router.buildRoutingPlan(taskProfile = profile, userPreferences = prefs)
+            assertTrue(
+                "TaskProfile ${profile.name} must have active Groq candidates",
+                plan.orderedCandidates.isNotEmpty()
+            )
+            assertEquals(AiProviderType.OPENAI_COMPATIBLE, plan.orderedCandidates.first().providerType)
+            assertEquals(AiModelRegistry.ID_GROQ_GPT_OSS_120B, plan.orderedCandidates.first().modelId)
+            assertEquals(com.example.data.ai.GroqSettings.MAIN_MODEL, plan.orderedCandidates.first().providerModelName)
+            assertEquals(AiModelRegistry.ID_GROQ_GPT_OSS_20B, plan.orderedCandidates[1].modelId)
+            assertEquals(com.example.data.ai.GroqSettings.FALLBACK_MODEL, plan.orderedCandidates[1].providerModelName)
+            assertTrue(
+                "No Google Gemini model should be routed by default",
+                plan.orderedCandidates.none { it.providerType == AiProviderType.FIREBASE_AI }
+            )
+        }
+    }
+
+    @Test
+    fun `openai responses serializer sets strict false on tools and auto-detects schema strictness`() {
+        val tools = com.example.data.ai.SharedToolCatalog.chatToolSpecs.map {
+            UnifiedToolSpec(it.name, it.description, it.parametersSchema)
+        }
+        val optionalSchema = com.example.data.ai.OpenRouterSchemas.obj(
+            properties = mapOf(
+                "title" to com.example.data.ai.OpenRouterSchemas.str(),
+                "note" to com.example.data.ai.OpenRouterSchemas.str()
+            ),
+            required = listOf("title")
+        )
+        val payloadWithOptional = ConversationSerializer.toOpenAiResponsesPayload(
+            model = "gpt-4o-mini",
+            systemPrompt = "You are ALLORA.",
+            messages = listOf(UnifiedMessage(role = "user", text = "Hello")),
+            tools = tools,
+            maxTokens = 8,
+            responseFormatName = "optional_plan",
+            responseFormatSchema = optionalSchema
+        )
+        assertEquals(16, payloadWithOptional["max_output_tokens"]?.jsonPrimitive?.contentOrNull?.toInt())
+        val serializedTools = payloadWithOptional["tools"]!!.jsonArray
+        assertEquals(tools.size, serializedTools.size)
+        serializedTools.forEach { toolElem ->
+            assertEquals("false", toolElem.jsonObject["strict"]?.jsonPrimitive?.contentOrNull)
+        }
+        val optionalFormat = payloadWithOptional["text"]!!.jsonObject["format"]!!.jsonObject
+        assertEquals("false", optionalFormat["strict"]?.jsonPrimitive?.contentOrNull)
+
+        val strictSchema = com.example.data.ai.OpenRouterSchemas.obj(
+            properties = mapOf("title" to com.example.data.ai.OpenRouterSchemas.str()),
+            required = listOf("title"),
+            additionalProperties = false
+        )
+        val payloadWithStrict = ConversationSerializer.toOpenAiResponsesPayload(
+            model = "gpt-4o-mini",
+            systemPrompt = "You are ALLORA.",
+            messages = listOf(UnifiedMessage(role = "user", text = "Hello")),
+            responseFormatName = "strict_plan",
+            responseFormatSchema = strictSchema
+        )
+        val strictFormat = payloadWithStrict["text"]!!.jsonObject["format"]!!.jsonObject
+        assertEquals("true", strictFormat["strict"]?.jsonPrimitive?.contentOrNull)
+    }
+
+    @Test
+    fun `openai adapter executes audio transcription against audio transcriptions endpoint and classifies missing key`() = runBlocking {
+        // 1. Missing GROQ_API_KEY triggers clear Groq Secrets error (never Firebase App Check wording)
+        val unconfiguredOrchestrator = AiModelOrchestrator(
+            adapters = mapOf(
+                AiProviderType.FIREBASE_AI to FirebaseAiProviderAdapter(),
+                AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(apiKeyResolver = { "" })
+            ),
+            sleepFn = {}
+        )
+        val missingKeyErr = runCatching {
+            unconfiguredOrchestrator.executeTurn(
+                snapshot = TurnContextSnapshot("req_no_key", "u_1", "sys", emptyList(), "Hello"),
+                taskProfile = AiTaskProfile.SIMPLE_CHAT
+            )
+        }.exceptionOrNull() as? AiProviderException
+        assertNotNull(missingKeyErr)
+        assertEquals(AiFailureCategory.AUTH_OR_KEY_ERROR, missingKeyErr?.category)
+        val friendlyMissing = com.example.data.ai.FirebaseAiChatBackend.classifyAiErrorMessage(missingKeyErr!!)
+        assertTrue(friendlyMissing.contains("GROQ_API_KEY"))
+        assertFalse(friendlyMissing.contains("App Check", ignoreCase = true))
+
+        // 2. WAV audio transcription routes to /v1/audio/transcriptions
+        val server = okhttp3.mockwebserver.MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                okhttp3.mockwebserver.MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody("""{"text":"Plan a trip to Tokyo"}""")
+            )
+            val openAiConfig = AiModelRegistry.defaultSeedModels()
+                .first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }
+                .copy(enabled = true, endpointUrl = server.url("/v1/responses").toString())
+            val orchestrator = AiModelOrchestrator(
+                registry = AiModelRegistry(listOf(openAiConfig)),
+                adapters = mapOf(
+                    AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                        apiKeyResolver = { "sk-test-openai-audio" }
+                    )
+                ),
+                sleepFn = {}
+            )
+            val manager = AiRequestManager(orchestrator)
+            val wavResult = manager.transcribeWavAudio(
+                wavBytes = byteArrayOf(0x52, 0x49, 0x46, 0x46, 0x00, 0x01),
+                prompt = "Transcribe English speech"
+            )
+            assertEquals("Plan a trip to Tokyo", wavResult.text)
+            val recorded = server.takeRequest()
+            assertEquals("/v1/audio/transcriptions", recorded.path)
+            assertTrue(recorded.getHeader("Content-Type").orEmpty().contains("multipart/form-data"))
+            val bodyStr = recorded.body.readUtf8()
+            assertTrue(bodyStr.contains("gpt-4o-mini-transcribe"))
+            assertTrue(bodyStr.contains("speech.wav"))
         } finally {
             server.shutdown()
         }

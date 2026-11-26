@@ -1,6 +1,7 @@
 package com.example.data.ai.orchestrator
 
 import android.util.Base64
+import com.example.data.ai.GroqSettings
 import com.example.data.ai.OpenRouterClient
 import com.example.data.ai.OpenRouterToolSpec
 import kotlinx.coroutines.CancellationException
@@ -21,6 +22,7 @@ import kotlinx.serialization.json.putJsonArray
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -32,23 +34,73 @@ import kotlin.coroutines.resumeWithException
 
 /**
  * Runtime-configurable OpenAI-compatible provider adapter.
- * Strictly disabled (`isConfiguredForModel == false`) unless BOTH a valid HTTPS endpoint URL
- * and a non-placeholder API key are supplied at runtime via config/Secrets.
+ *
+ * Security model:
+ * - Production builds authenticate requests to a custom HTTPS backend proxy (`OPENAI_PROXY_URL`
+ *   or remote Firestore `endpointUrl`) using a short-lived Firebase ID token (`Bearer <idToken>`),
+ *   so production OpenAI API keys are NEVER embedded in the Android APK or `BuildConfig`.
+ * - Direct bearer keys via [apiKeyResolver] are supported exclusively for isolated test harnesses.
  */
 class OpenAiCompatibleProviderAdapter(
     private val apiKeyResolver: (modelId: String) -> String = { "" },
-    private val httpClient: OkHttpClient = OpenRouterClient.sharedHttpClient
+    private val httpClient: OkHttpClient = OpenRouterClient.sharedHttpClient,
+    private val endpointResolver: ((AiModelConfig) -> String?)? = null,
+    private val firebaseIdTokenResolver: (suspend () -> String?)? = null
 ) : AiProviderAdapter {
 
     override val providerType: AiProviderType = AiProviderType.OPENAI_COMPATIBLE
 
+    internal fun resolveEndpointUrl(config: AiModelConfig): String {
+        val overridden = endpointResolver?.invoke(config)?.trim().orEmpty()
+        return if (overridden.isNotBlank()) overridden else config.endpointUrl?.trim().orEmpty()
+    }
+
+    private fun isValidEndpointUrl(url: String): Boolean {
+        if (url.isBlank() ||
+            url.contains("YOUR_GROQ_PROXY_URL") ||
+            url.contains("YOUR_OPENAI_PROXY_URL")
+        ) return false
+        return url.startsWith("https://") ||
+            url.startsWith("http://localhost") ||
+            url.startsWith("http://127.0.0.1")
+    }
+
+    private fun isDirectOpenAiHost(url: String): Boolean {
+        val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull().orEmpty()
+        return host == "api.groq.com" ||
+            host == "api.openai.com" ||
+            url.startsWith("https://api.groq.com") ||
+            url.startsWith("https://api.openai.com")
+    }
+
+    fun diagnosticConfigStatus(config: AiModelConfig): String {
+        val url = resolveEndpointUrl(config)
+        if (!isValidEndpointUrl(url)) {
+            return "Invalid or missing Groq endpoint/proxy URL"
+        }
+        val explicitKey = apiKeyResolver(config.modelId).trim()
+            .takeIf { it.isNotBlank() && !it.startsWith("YOUR_") }
+        if (explicitKey != null) {
+            return "Configured (API key -> ${AiPipelineDiagnostics.formatEndpointHostForLog(url)})"
+        }
+        if (firebaseIdTokenResolver != null) {
+            if (isDirectOpenAiHost(url)) {
+                return "Unconfigured: GROQ_PROXY_URL not set (refusing to send Firebase ID token directly)"
+            }
+            return "Configured (Firebase ID token proxy -> ${AiPipelineDiagnostics.formatEndpointHostForLog(url)})"
+        }
+        return "Unconfigured: GROQ_API_KEY not configured — add GROQ_API_KEY in the AI Studio Secrets panel"
+    }
+
     override fun isConfiguredForModel(config: AiModelConfig): Boolean {
-        val url = config.endpointUrl?.trim().orEmpty()
-        val key = apiKeyResolver(config.modelId).trim()
-        return config.providerType == AiProviderType.OPENAI_COMPATIBLE &&
-            (url.startsWith("https://") || url.startsWith("http://localhost") || url.startsWith("http://127.0.0.1")) &&
-            key.isNotBlank() &&
-            !key.startsWith("YOUR_")
+        if (config.providerType != AiProviderType.OPENAI_COMPATIBLE) return false
+        val url = resolveEndpointUrl(config)
+        if (!isValidEndpointUrl(url)) return false
+        val explicitKey = apiKeyResolver(config.modelId).trim()
+        if (explicitKey.isNotBlank() && !explicitKey.startsWith("YOUR_")) {
+            return true
+        }
+        return firebaseIdTokenResolver != null && !isDirectOpenAiHost(url)
     }
 
     override suspend fun execute(
@@ -56,24 +108,88 @@ class OpenAiCompatibleProviderAdapter(
         request: UnifiedAiRequest,
         onTextDelta: (String) -> Unit
     ): UnifiedAiResponse {
-        val endpoint = config.endpointUrl?.trim().orEmpty()
-        val apiKey = apiKeyResolver(config.modelId).trim()
+        val endpoint = resolveEndpointUrl(config)
+        val explicitKey = apiKeyResolver(config.modelId).trim()
+            .takeIf { it.isNotBlank() && !it.startsWith("YOUR_") }
+
         if (!isConfiguredForModel(config)) {
+            val status = diagnosticConfigStatus(config)
+            AiPipelineDiagnostics.logStage(
+                requestId = request.requestId,
+                stage = "GROQ_UNCONFIGURED",
+                message = "model=${config.providerModelName} reason=$status",
+                isError = true
+            )
             throw AiProviderException(
                 category = AiFailureCategory.AUTH_OR_KEY_ERROR,
                 statusCode = 401,
                 providerId = providerType.name,
                 modelId = config.modelId,
-                message = "OpenAI-compatible endpoint or API key is not configured for ${config.displayName}."
+                message = "Groq unavailable: $status"
             )
         }
 
-        // Only legacy chat/completions endpoints use OpenRouterClient; OpenAI Direct defaults to /v1/responses.
+        val authMode: String
+        val bearerToken: String
+        if (explicitKey != null) {
+            authMode = "api-key"
+            bearerToken = explicitKey
+        } else {
+            authMode = "firebase-id-token"
+            val idToken = runCatching { firebaseIdTokenResolver?.invoke()?.trim().orEmpty() }.getOrElse { err ->
+                throw AiProviderException(
+                    category = AiFailureCategory.AUTH_OR_KEY_ERROR,
+                    statusCode = 401,
+                    retryable = true,
+                    providerId = providerType.name,
+                    modelId = config.modelId,
+                    message = "Groq proxy token unavailable (${AiFailureClassifier.sanitizeDetail(err.message.orEmpty(), 100)}).",
+                    cause = err
+                )
+            }
+            if (idToken.isBlank()) {
+                throw AiProviderException(
+                    category = AiFailureCategory.AUTH_OR_KEY_ERROR,
+                    statusCode = 401,
+                    retryable = true,
+                    providerId = providerType.name,
+                    modelId = config.modelId,
+                    message = "Groq requires GROQ_API_KEY or an authenticated proxy endpoint."
+                )
+            }
+            bearerToken = idToken
+        }
+
+        AiPipelineDiagnostics.logStage(
+            requestId = request.requestId,
+            stage = "OPENAI_INIT",
+            message = "model=${config.providerModelName} endpoint=${AiPipelineDiagnostics.formatEndpointHostForLog(endpoint)} auth=$authMode stream=${request.stream}"
+        )
+
+        val audioPart = request.messages.asSequence()
+            .flatMap { it.parts.asSequence() }
+            .filterIsInstance<UnifiedPart.AudioWav>()
+            .firstOrNull()
+        if (request.taskProfile == AiTaskProfile.AUDIO_TRANSCRIPTION || audioPart != null) {
+            return executeAudioTranscription(
+                endpoint = endpoint,
+                bearerToken = bearerToken,
+                config = config,
+                request = request,
+                audioPart = audioPart,
+                onTextDelta = onTextDelta
+            )
+        }
+
+        // Only legacy chat/completions endpoints use OpenRouterClient; OpenAI Direct / Proxy defaults to /v1/responses.
         if (endpoint.endsWith("/chat/completions")) {
-            return executeLegacyChatCompletions(endpoint, apiKey, config, request, onTextDelta)
+            return executeLegacyChatCompletions(endpoint, bearerToken, config, request, onTextDelta)
         }
 
         val shouldStream = request.stream && request.responseFormatSchema == null
+        val enableWebSearch = request.enableGoogleSearchGrounding &&
+            request.tools.isEmpty() &&
+            isDirectOpenAiHost(endpoint)
         val payloadObj = withContext(Dispatchers.Default) {
             ConversationSerializer.toOpenAiResponsesPayload(
                 model = config.providerModelName,
@@ -85,14 +201,16 @@ class OpenAiCompatibleProviderAdapter(
                 stream = shouldStream,
                 responseFormatName = request.responseFormatName,
                 responseFormatSchema = request.responseFormatSchema,
-                previousResponseId = request.previousOpenAiResponseId
+                previousResponseId = request.previousOpenAiResponseId,
+                enableWebSearch = enableWebSearch
             )
         }
 
         val httpReq = Request.Builder()
             .url(endpoint)
-            .header("Authorization", "Bearer $apiKey")
+            .header("Authorization", "Bearer $bearerToken")
             .header("Content-Type", "application/json")
+            .header("X-Allora-Provider-Model", config.providerModelName)
             .post(payloadObj.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
 
@@ -104,6 +222,12 @@ class OpenAiCompatibleProviderAdapter(
                     cont.invokeOnCancellation { call.cancel() }
                     call.enqueue(object : Callback {
                         override fun onFailure(call: Call, e: IOException) {
+                            AiPipelineDiagnostics.logStage(
+                                requestId = request.requestId,
+                                stage = "OPENAI_IO_FAIL",
+                                message = "model=${config.providerModelName} cause=${AiFailureClassifier.sanitizeExceptionChain(e)}",
+                                isError = true
+                            )
                             if (!cont.isCompleted) cont.resumeWithException(e)
                         }
 
@@ -112,6 +236,12 @@ class OpenAiCompatibleProviderAdapter(
                                 if (!res.isSuccessful) {
                                     val rawErr = res.body?.string().orEmpty()
                                     val ex = mapHttpFailure(res.code, res.header("Retry-After"), rawErr, config.modelId)
+                                    AiPipelineDiagnostics.logStage(
+                                        requestId = request.requestId,
+                                        stage = "OPENAI_HTTP_FAIL",
+                                        message = "model=${config.providerModelName} http=${res.code} cat=${ex.category} msg=${ex.message}",
+                                        isError = true
+                                    )
                                     if (!cont.isCompleted) cont.resumeWithException(ex)
                                     return
                                 }
@@ -143,9 +273,148 @@ class OpenAiCompatibleProviderAdapter(
                                     }
                                 }
                                 result.fold(
-                                    onSuccess = { parsed -> if (!cont.isCompleted) cont.resume(parsed) },
-                                    onFailure = { err -> if (!cont.isCompleted) cont.resumeWithException(err) }
+                                    onSuccess = { parsed ->
+                                        AiPipelineDiagnostics.logStage(
+                                            requestId = request.requestId,
+                                            stage = "OPENAI_DONE",
+                                            message = "model=${parsed.providerModelUsed} http=${res.code} textLen=${parsed.text.length} interrupted=${parsed.streamInterrupted} toolCalls=${parsed.toolCalls.size}"
+                                        )
+                                        if (!cont.isCompleted) cont.resume(parsed)
+                                    },
+                                    onFailure = { err ->
+                                        AiPipelineDiagnostics.logStage(
+                                            requestId = request.requestId,
+                                            stage = "OPENAI_PARSE_FAIL",
+                                            message = "model=${config.providerModelName} cause=${AiFailureClassifier.sanitizeExceptionChain(err)}",
+                                            isError = true
+                                        )
+                                        if (!cont.isCompleted) cont.resumeWithException(err)
+                                    }
                                 )
+                            }
+                        }
+                    })
+                }
+            }
+        } catch (ce: CancellationException) {
+            if (ce is TimeoutCancellationException) {
+                throw AiFailureClassifier.toProviderException(ce, providerType, config.modelId)
+            }
+            throw ce
+        } catch (t: Throwable) {
+            throw AiFailureClassifier.toProviderException(t, providerType, config.modelId)
+        }
+    }
+
+    internal fun resolveAudioTranscriptionEndpoint(responsesOrChatEndpoint: String): String {
+        val clean = responsesOrChatEndpoint.trim().trimEnd('/')
+        return when {
+            clean.endsWith("/v1/responses") ->
+                clean.removeSuffix("/v1/responses") + "/v1/audio/transcriptions"
+            clean.endsWith("/v1/chat/completions") ->
+                clean.removeSuffix("/v1/chat/completions") + "/v1/audio/transcriptions"
+            clean.endsWith("/responses") ->
+                clean.removeSuffix("/responses") + "/audio/transcriptions"
+            clean.endsWith("/chat/completions") ->
+                clean.removeSuffix("/chat/completions") + "/audio/transcriptions"
+            clean.endsWith("/audio/transcriptions") -> clean
+            else -> GroqSettings.AUDIO_TRANSCRIPTIONS_URL
+        }
+    }
+
+    private suspend fun executeAudioTranscription(
+        endpoint: String,
+        bearerToken: String,
+        config: AiModelConfig,
+        request: UnifiedAiRequest,
+        audioPart: UnifiedPart.AudioWav?,
+        onTextDelta: (String) -> Unit
+    ): UnifiedAiResponse {
+        if (audioPart == null || audioPart.wavBytes.isEmpty()) {
+            throw AiProviderException(
+                category = AiFailureCategory.INVALID_REQUEST,
+                statusCode = 400,
+                retryable = false,
+                providerId = providerType.name,
+                modelId = config.modelId,
+                message = "Audio transcription requires non-empty WAV audio data."
+            )
+        }
+        val audioEndpoint = resolveAudioTranscriptionEndpoint(endpoint)
+        val audioModelName = if (audioEndpoint.contains("api.openai.com", ignoreCase = true) ||
+            endpoint.endsWith("/v1/responses")
+        ) {
+            "gpt-4o-mini-transcribe"
+        } else {
+            GroqSettings.AUDIO_TRANSCRIPTION_MODEL
+        }
+        val promptHint = request.messages
+            .flatMap { msg ->
+                if (msg.parts.isNotEmpty()) msg.parts.filterIsInstance<UnifiedPart.Text>().map { it.text }
+                else listOfNotNull(msg.text)
+            }
+            .joinToString(" ")
+            .trim()
+        val multipart = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(
+                name = "file",
+                filename = "speech.wav",
+                body = audioPart.wavBytes.toRequestBody("audio/wav".toMediaType())
+            )
+            .addFormDataPart("model", audioModelName)
+            .addFormDataPart("response_format", "json")
+            .apply {
+                if (promptHint.isNotBlank()) {
+                    addFormDataPart("prompt", promptHint.take(400))
+                }
+            }
+            .build()
+
+        val httpReq = Request.Builder()
+            .url(audioEndpoint)
+            .header("Authorization", "Bearer $bearerToken")
+            .post(multipart)
+            .build()
+
+        val startMs = System.currentTimeMillis()
+        return try {
+            withTimeout(request.timeoutMs.coerceAtLeast(5_000L)) {
+                suspendCancellableCoroutine { cont ->
+                    val call = httpClient.newCall(httpReq)
+                    cont.invokeOnCancellation { call.cancel() }
+                    call.enqueue(object : Callback {
+                        override fun onFailure(call: Call, e: IOException) {
+                            if (!cont.isCompleted) cont.resumeWithException(e)
+                        }
+
+                        override fun onResponse(call: Call, response: Response) {
+                            response.use { res ->
+                                val raw = res.body?.string().orEmpty()
+                                if (!res.isSuccessful) {
+                                    val ex = mapHttpFailure(res.code, res.header("Retry-After"), raw, config.modelId)
+                                    if (!cont.isCompleted) cont.resumeWithException(ex)
+                                    return
+                                }
+                                val transcribed = runCatching {
+                                    val obj = OpenRouterClient.jsonParser.parseToJsonElement(raw).jsonObject
+                                    obj["text"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+                                }.getOrElse { raw.trim() }
+                                val ttft = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+                                if (transcribed.isNotEmpty()) {
+                                    onTextDelta(transcribed)
+                                }
+                                if (!cont.isCompleted) {
+                                    cont.resume(
+                                        UnifiedAiResponse(
+                                            text = transcribed,
+                                            providerModelUsed = audioModelName,
+                                            promptTokensEstimate = (audioPart.wavBytes.size / 1000).coerceAtLeast(16),
+                                            completionTokensEstimate = (transcribed.length / 4).coerceAtLeast(4),
+                                            ttftMs = ttft
+                                        )
+                                    )
+                                }
                             }
                         }
                     })
@@ -171,7 +440,8 @@ class OpenAiCompatibleProviderAdapter(
         val delegateClient = OpenRouterClient(
             chatCompletionsUrl = endpoint,
             apiKeyProvider = { apiKey },
-            httpClient = httpClient
+            httpClient = httpClient,
+            defaultProviderId = providerType.name
         )
         val messages = ConversationSerializer.toOpenAiMessages(
             systemPrompt = request.systemPrompt,
@@ -242,13 +512,16 @@ class OpenAiCompatibleProviderAdapter(
         rawErr: String,
         modelId: String
     ): AiProviderException {
-        val category = when (code) {
-            429 -> AiFailureCategory.RATE_LIMIT_429
-            401, 403 -> AiFailureCategory.AUTH_OR_KEY_ERROR
-            402 -> AiFailureCategory.PAYMENT_OR_QUOTA
-            404 -> AiFailureCategory.MODEL_NOT_FOUND
-            400 -> AiFailureCategory.INVALID_REQUEST
-            in 500..599 -> AiFailureCategory.SERVER_ERROR_5XX
+        val lowerErr = rawErr.lowercase()
+        val category = when {
+            code == 429 && (lowerErr.contains("insufficient_quota") || lowerErr.contains("exceeded your current quota") || lowerErr.contains("billing")) ->
+                AiFailureCategory.PAYMENT_OR_QUOTA
+            code == 429 -> AiFailureCategory.RATE_LIMIT_429
+            code == 401 || code == 403 -> AiFailureCategory.AUTH_OR_KEY_ERROR
+            code == 402 -> AiFailureCategory.PAYMENT_OR_QUOTA
+            code == 404 -> AiFailureCategory.MODEL_NOT_FOUND
+            code == 400 -> AiFailureCategory.INVALID_REQUEST
+            code in 500..599 -> AiFailureCategory.SERVER_ERROR_5XX
             else -> AiFailureCategory.UNKNOWN
         }
         return AiProviderException(
@@ -477,24 +750,28 @@ class OpenAiCompatibleProviderAdapter(
                         val respObj = obj["response"] as? JsonObject
                         responseId = respObj?.get("id")?.jsonPrimitive?.contentOrNull ?: responseId
                         respObj?.get("model")?.jsonPrimitive?.contentOrNull?.let { if (it.isNotBlank()) modelUsed = it }
-                        if (textAcc.isEmpty() && fnOrder.isEmpty() && respObj != null) {
+                        if (respObj != null) {
                             val parsedFallback = parseResponsesJson(
                                 rawJson = respObj.toString(),
                                 fallbackModel = modelUsed,
                                 request = request,
                                 ttftMs = ttftMs.coerceAtLeast(1L)
                             )
-                            if (parsedFallback.text.isNotEmpty()) {
-                                textAcc.append(parsedFallback.text)
-                                onTextDelta(parsedFallback.text)
+                            parsedFallback.citations.forEach { cite ->
+                                if (citations.none { it.url == cite.url }) citations.add(cite)
                             }
-                            citations.addAll(parsedFallback.citations)
-                            parsedFallback.toolCalls.forEach { tc ->
-                                fnOrder.add(
-                                    FnCallDraft(itemId = tc.id, callId = tc.id, name = tc.name).apply {
-                                        args.append(tc.argumentsJson)
-                                    }
-                                )
+                            if (textAcc.isEmpty() && fnOrder.isEmpty()) {
+                                if (parsedFallback.text.isNotEmpty()) {
+                                    textAcc.append(parsedFallback.text)
+                                    onTextDelta(parsedFallback.text)
+                                }
+                                parsedFallback.toolCalls.forEach { tc ->
+                                    fnOrder.add(
+                                        FnCallDraft(itemId = tc.id, callId = tc.id, name = tc.name).apply {
+                                            args.append(tc.argumentsJson)
+                                        }
+                                    )
+                                }
                             }
                         }
                     }

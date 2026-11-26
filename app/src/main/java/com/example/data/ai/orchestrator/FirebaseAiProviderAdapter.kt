@@ -44,6 +44,12 @@ class LiveFirebaseGeminiExecutor : GeminiPayloadExecutor {
     ): UnifiedAiResponse {
         val startMs = System.currentTimeMillis()
         var ttftMs = 0L
+        val projectSummary = AiPipelineDiagnostics.resolveFirebaseProjectSummary()
+        AiPipelineDiagnostics.logStage(
+            requestId = request.requestId,
+            stage = "GEMINI_INIT",
+            message = "provider=FIREBASE_AI model=${config.providerModelName} ($projectSummary) turns=${serialized.contents.size} tools=${request.tools.size} stream=${request.stream}"
+        )
 
         val genConfig = generationConfig {
             temperature = request.temperature.toFloat().coerceIn(0f, 1.5f)
@@ -69,9 +75,13 @@ class LiveFirebaseGeminiExecutor : GeminiPayloadExecutor {
         val rawModelParts = mutableListOf<Part>()
         val groundingCitations = mutableListOf<UnifiedCitation>()
         val groundingQueries = mutableListOf<String>()
+        var streamChunkCount = 0
+        var lastFinishReason: String? = null
 
-        fun captureCandidatePartsAndGrounding(candidate: com.google.firebase.ai.type.Candidate?) {
-            if (candidate == null) return
+        fun captureCandidatePartsAndGrounding(candidate: com.google.firebase.ai.type.Candidate?): String {
+            if (candidate == null) return ""
+            candidate.finishReason?.name?.let { lastFinishReason = it }
+            val visibleDelta = StringBuilder()
             val parts = candidate.content.parts
             if (parts.isNotEmpty()) {
                 parts.forEach { part ->
@@ -89,6 +99,12 @@ class LiveFirebaseGeminiExecutor : GeminiPayloadExecutor {
                                     isThought = part.isThought
                                 )
                             )
+                        }
+                        is TextPart -> {
+                            rawModelParts.add(part)
+                            if (!part.isThought && part.text.isNotEmpty()) {
+                                visibleDelta.append(part.text)
+                            }
                         }
                         else -> rawModelParts.add(part)
                     }
@@ -111,81 +127,110 @@ class LiveFirebaseGeminiExecutor : GeminiPayloadExecutor {
                     }
                 }
             }
+            return visibleDelta.toString()
         }
 
-        if (request.stream && responseSchema == null) {
-            val stream = if (allContents.size > 1) {
-                val history = allContents.dropLast(1)
-                val chat = model.startChat(history = history)
-                chat.sendMessageStream(allContents.last())
-            } else {
-                model.generateContentStream(allContents.first())
-            }
+        try {
+            if (request.stream && responseSchema == null) {
+                val stream = if (allContents.size > 1) {
+                    val history = allContents.dropLast(1)
+                    val chat = model.startChat(history = history)
+                    chat.sendMessageStream(allContents.last())
+                } else {
+                    model.generateContentStream(allContents.first())
+                }
 
-            stream.collect { chunk ->
-                val primaryCandidate = chunk.candidates.firstOrNull()
-                if (primaryCandidate != null) {
-                    captureCandidatePartsAndGrounding(primaryCandidate)
-                } else if (chunk.functionCalls.isNotEmpty()) {
-                    chunk.functionCalls.forEachIndexed { idx, fc ->
-                        rawModelParts.add(fc)
-                        val callId = fc.id?.takeIf { it.isNotBlank() }
-                            ?: "fb_call_${functionCalls.size + idx + 1}"
-                        functionCalls.add(
-                            UnifiedToolCall(
-                                id = callId,
-                                name = fc.name,
-                                argumentsJson = JsonObject(fc.args).toString(),
-                                thoughtSignature = fc.thoughtSignature,
-                                isThought = fc.isThought
-                            )
-                        )
+                stream.collect { chunk ->
+                    streamChunkCount++
+                    val primaryCandidate = chunk.candidates.firstOrNull()
+                    val candidateVisibleText = if (primaryCandidate != null) {
+                        captureCandidatePartsAndGrounding(primaryCandidate)
+                    } else {
+                        if (chunk.functionCalls.isNotEmpty()) {
+                            chunk.functionCalls.forEachIndexed { idx, fc ->
+                                rawModelParts.add(fc)
+                                val callId = fc.id?.takeIf { it.isNotBlank() }
+                                    ?: "fb_call_${functionCalls.size + idx + 1}"
+                                functionCalls.add(
+                                    UnifiedToolCall(
+                                        id = callId,
+                                        name = fc.name,
+                                        argumentsJson = JsonObject(fc.args).toString(),
+                                        thoughtSignature = fc.thoughtSignature,
+                                        isThought = fc.isThought
+                                    )
+                                )
+                            }
+                        }
+                        ""
+                    }
+                    val delta = candidateVisibleText.ifEmpty {
+                        runCatching { chunk.text }.getOrNull().orEmpty()
+                    }
+                    if (delta.isNotEmpty()) {
+                        if (ttftMs == 0L) {
+                            ttftMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+                        }
+                        textAcc.append(delta)
+                        onTextDelta(delta)
                     }
                 }
-                val delta = runCatching { chunk.text }.getOrNull().orEmpty()
-                if (delta.isNotEmpty()) {
-                    if (ttftMs == 0L) {
-                        ttftMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-                    }
-                    textAcc.append(delta)
-                    onTextDelta(delta)
-                }
-            }
-        } else {
-            val response = if (allContents.size > 1) {
-                val history = allContents.dropLast(1)
-                val chat = model.startChat(history = history)
-                chat.sendMessage(allContents.last())
             } else {
-                model.generateContent(allContents.first())
-            }
-            ttftMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-            val primaryCandidate = response.candidates.firstOrNull()
-            if (primaryCandidate != null) {
-                captureCandidatePartsAndGrounding(primaryCandidate)
-            } else if (response.functionCalls.isNotEmpty()) {
-                response.functionCalls.forEachIndexed { idx, fc ->
-                    rawModelParts.add(fc)
-                    val callId = fc.id?.takeIf { it.isNotBlank() } ?: "fb_call_${idx + 1}"
-                    functionCalls.add(
-                        UnifiedToolCall(
-                            id = callId,
-                            name = fc.name,
-                            argumentsJson = JsonObject(fc.args).toString(),
-                            thoughtSignature = fc.thoughtSignature,
-                            isThought = fc.isThought
-                        )
-                    )
+                val response = if (allContents.size > 1) {
+                    val history = allContents.dropLast(1)
+                    val chat = model.startChat(history = history)
+                    chat.sendMessage(allContents.last())
+                } else {
+                    model.generateContent(allContents.first())
+                }
+                ttftMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+                val primaryCandidate = response.candidates.firstOrNull()
+                val candidateVisibleText = if (primaryCandidate != null) {
+                    captureCandidatePartsAndGrounding(primaryCandidate)
+                } else {
+                    if (response.functionCalls.isNotEmpty()) {
+                        response.functionCalls.forEachIndexed { idx, fc ->
+                            rawModelParts.add(fc)
+                            val callId = fc.id?.takeIf { it.isNotBlank() } ?: "fb_call_${idx + 1}"
+                            functionCalls.add(
+                                UnifiedToolCall(
+                                    id = callId,
+                                    name = fc.name,
+                                    argumentsJson = JsonObject(fc.args).toString(),
+                                    thoughtSignature = fc.thoughtSignature,
+                                    isThought = fc.isThought
+                                )
+                            )
+                        }
+                    }
+                    ""
+                }
+                val txt = candidateVisibleText.ifEmpty {
+                    runCatching { response.text }.getOrNull().orEmpty()
+                }
+                if (txt.isNotEmpty()) {
+                    textAcc.append(txt)
+                    onTextDelta(txt)
                 }
             }
-            val txt = runCatching { response.text }.getOrNull().orEmpty()
-            if (txt.isNotEmpty()) {
-                textAcc.append(txt)
-                onTextDelta(txt)
-            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            AiPipelineDiagnostics.logStage(
+                requestId = request.requestId,
+                stage = "GEMINI_ERROR",
+                message = "model=${config.providerModelName} chunks=$streamChunkCount cause=${AiFailureClassifier.sanitizeExceptionChain(t)}",
+                isError = true
+            )
+            throw t
         }
 
         val finalText = textAcc.toString()
+        AiPipelineDiagnostics.logStage(
+            requestId = request.requestId,
+            stage = "GEMINI_DONE",
+            message = "model=${config.providerModelName} chunks=$streamChunkCount finish=$lastFinishReason textLen=${finalText.length} toolCalls=${functionCalls.size} ttftMs=$ttftMs"
+        )
         val preservedModelContent = if (rawModelParts.isNotEmpty()) {
             Content("model", rawModelParts)
         } else {
@@ -317,6 +362,10 @@ class FirebaseAiProviderAdapter(
                 optional.add(key)
             }
         }
+        if (params.isEmpty()) {
+            params["context_note"] = Schema.string(description = "Optional tool call note")
+            optional.add("context_note")
+        }
         return FunctionDeclaration(
             name = spec.name,
             description = spec.description,
@@ -348,8 +397,12 @@ class FirebaseAiProviderAdapter(
                     .orEmpty()
                 val mapped = propsObj.mapValues { (_, child) ->
                     toFirebaseSchema(child as? JsonObject ?: JsonObject(emptyMap()))
+                }.toMutableMap()
+                val optional = mapped.keys.filter { it !in requiredList }.toMutableList()
+                if (mapped.isEmpty()) {
+                    mapped["detail"] = Schema.string(description = "Optional detail")
+                    optional.add("detail")
                 }
-                val optional = mapped.keys.filter { it !in requiredList }
                 Schema.obj(
                     properties = mapped,
                     optionalProperties = optional,

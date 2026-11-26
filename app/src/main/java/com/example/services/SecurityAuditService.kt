@@ -82,7 +82,7 @@ class SecurityAuditService(
         private val CARD_PAN_REGEX = Regex("""\b(?:\d[ -]*?){13,19}\b""")
         private val CVV_REGEX = Regex("""(?i)\b(cvv|cvc|pin|upi\s*pin|otp|password|passcode|bearer)\s*[:=#]?\s*([A-Za-z0-9._\-]{3,64})""")
         private val TOKEN_KV_REGEX = Regex("""(?i)\b(access_token|refresh_token|id_token|client_secret|api_key|authorization)\s*[:=]\s*["']?([A-Za-z0-9._\-+/=]{6,256})["']?""")
-        private val KEY_PREFIX_REGEX = Regex("""\b(sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{16,})\b""")
+        private val KEY_PREFIX_REGEX = Regex("""\b(gsk_[A-Za-z0-9_\-]{12,}|sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{16,})\b""")
         private val AUTH_HEADER_REGEX = Regex("""(?i)(Bearer|ya29\.[A-Za-z0-9_\-]+)\s*[A-Za-z0-9._\-]*""")
 
         /**

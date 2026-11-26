@@ -46,16 +46,16 @@ enum class VoiceEngineMode(
     val subtitle: String
 ) {
     GROUNDED_STREAMING(
-        title = "Fast Voice + Tools (Flash)",
+        title = "Fast Voice + Tools (GPT-4o Mini)",
         modelName = OpenRouterModels.LIVE_VOICE_FAST,
         fallbackModels = OpenRouterModels.VOICE_FALLBACKS,
-        subtitle = "OpenRouter Gemini 2.5 Flash • Ultra-low latency, Actions & TTS"
+        subtitle = "OpenAI GPT-4o Mini • Ultra-low latency, Actions & TTS"
     ),
     PRECISION_REASONING(
-        title = "Precision + Tools (Haiku)",
+        title = "Precision + Tools (GPT-4o)",
         modelName = OpenRouterModels.PRECISION_REASONING,
         fallbackModels = OpenRouterModels.PRECISION_FALLBACKS,
-        subtitle = "OpenRouter Claude 3.5 Haiku • Deep analysis, Actions & TTS"
+        subtitle = "OpenAI GPT-4o • Deep analysis, Actions & TTS"
     )
 }
 

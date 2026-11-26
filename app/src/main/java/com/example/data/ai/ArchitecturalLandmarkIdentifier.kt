@@ -129,7 +129,7 @@ class ArchitecturalLandmarkIdentifier(
             updateUserPreferences(
                 AiUserPreferences(
                     selectionMode = AiSelectionMode.AUTOMATIC,
-                    preferredModelId = AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH,
+                    preferredModelId = AiModelRegistry.ID_GROQ_GPT_OSS_120B,
                     autoSwitchOnFailure = true
                 )
             )

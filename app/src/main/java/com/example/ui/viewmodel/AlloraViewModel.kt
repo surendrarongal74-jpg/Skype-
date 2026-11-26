@@ -10,11 +10,13 @@ import com.example.agent.ExternalConnectorDescriptor
 import com.example.agent.TaskExecutionEngine
 import com.example.core.SecurityUtils
 import com.example.data.ai.AlloraAiService
+import com.example.data.ai.GroqSettings
 import com.example.data.ai.LandmarkIdentificationUiState
 import com.example.data.ai.orchestrator.AiCapability
 import com.example.data.ai.orchestrator.AiFailoverEvent
 import com.example.data.ai.orchestrator.AiModelConfig
 import com.example.data.ai.orchestrator.AiModelHealthSnapshot
+import com.example.data.ai.orchestrator.AiModelRegistry
 import com.example.data.ai.orchestrator.AiProviderType
 import com.example.data.ai.orchestrator.AiQuotaSnapshot
 import com.example.data.ai.orchestrator.AiRequestDiagnostics
@@ -96,7 +98,6 @@ import okhttp3.Request
 import java.util.concurrent.TimeUnit
 import com.example.ui.chat.BrowserCardAction
 import com.example.ui.components.OrbState
-import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -214,8 +215,6 @@ class AlloraViewModel(
     private val initialOnboardingHomeAirport: String? = null,
     private val locationTracker: TravelLocationTracker? = null,
     private val onStopTrackingService: (() -> Unit)? = null,
-    private val onAuthInvalidated: ((String) -> Unit)? = null,
-    private val onVerifySessionRequested: (() -> Unit)? = null,
     private val chatLocalStore: AlloraChatLocalStore? = null,
     private val attachmentBitmapLoader: ((String) -> Bitmap?)? = null,
     private val attachmentTextReader: ((String, String) -> String?)? = null,
@@ -404,7 +403,7 @@ class AlloraViewModel(
     private val _lastChatErrorCategory = MutableStateFlow<AlloraChatInterfaceState?>(null)
     val lastChatErrorCategory: StateFlow<AlloraChatInterfaceState?> = _lastChatErrorCategory.asStateFlow()
 
-    private val _aiStatusLabel = MutableStateFlow("Ready • Allora Gemini AI")
+    private val _aiStatusLabel = MutableStateFlow("Ready • ${GroqSettings.MAIN_MODEL_DISPLAY_NAME}")
     val aiStatusLabel: StateFlow<String> = _aiStatusLabel.asStateFlow()
 
     val aiStatusPhase: StateFlow<AiStatusPhase> = aiRequestManager.activeStatusPhase
@@ -681,7 +680,7 @@ class AlloraViewModel(
                         val id = doc.modelId.ifBlank { doc.id }.trim()
                         if (id.isEmpty()) return@mapNotNull null
                         val provider = runCatching { AiProviderType.valueOf(doc.providerType) }
-                            .getOrDefault(AiProviderType.FIREBASE_AI)
+                            .getOrDefault(AiProviderType.OPENAI_COMPATIBLE)
                         val caps = doc.capabilitiesCsv.split(",")
                             .mapNotNull { raw -> runCatching { AiCapability.valueOf(raw.trim()) }.getOrNull() }
                             .toSet()
@@ -699,7 +698,8 @@ class AlloraViewModel(
                             costPer1kInputUsd = doc.costPer1kInputUsd,
                             costPer1kOutputUsd = doc.costPer1kOutputUsd,
                             capabilities = caps,
-                            speedRating = doc.speedRating.ifBlank { "Fast" }
+                            speedRating = doc.speedRating.ifBlank { "Fast" },
+                            endpointUrl = doc.endpointUrl.trim().takeIf { it.isNotBlank() }
                         )
                     }
                     aiRequestManager.applyRemoteModelConfigs(mapped)
@@ -712,8 +712,8 @@ class AlloraViewModel(
                     aiRequestManager.updateUserPreferences(
                         AiUserPreferences(
                             selectionMode = mode,
-                            preferredModelId = doc.preferredModelId.ifBlank { "firebase_gemini_3_8_flash" },
-                            manualModelId = doc.manualModelId.ifBlank { "firebase_gemini_3_8_flash" },
+                            preferredModelId = doc.preferredModelId.ifBlank { AiModelRegistry.ID_GROQ_GPT_OSS_120B },
+                            manualModelId = doc.manualModelId.ifBlank { AiModelRegistry.ID_GROQ_GPT_OSS_120B },
                             autoSwitchOnFailure = doc.autoSwitchOnFailure
                         )
                     )
@@ -870,7 +870,7 @@ class AlloraViewModel(
                                 } else {
                                     doc.status
                                 }
-                                val createdMs = doc.createdAt?.toDate()?.time ?: System.currentTimeMillis()
+                                val createdMs = doc.createdAt ?: System.currentTimeMillis()
                                 BookingRecord(
                                     id = doc.id,
                                     userId = currentUserId,
@@ -956,7 +956,7 @@ class AlloraViewModel(
                                         plainText = cleanDocText,
                                         blocks = blocks,
                                         timestampLabel = "Synced",
-                                        createdAtMs = doc.createdAt?.toDate()?.time ?: System.currentTimeMillis(),
+                                        createdAtMs = doc.createdAt ?: System.currentTimeMillis(),
                                         isStreaming = false
                                     )
                                 }
@@ -988,20 +988,9 @@ class AlloraViewModel(
     }
 
     private fun handleStreamException(scopeLabel: String, error: Throwable) {
-        val firestoreError = generateSequence(error) { it.cause }
-            .filterIsInstance<FirebaseFirestoreException>()
-            .firstOrNull()
-        if (firestoreError == null && error is CancellationException) throw error
-        val root = firestoreError ?: error
-        Log.w(TAG, "Error observing $scopeLabel", root)
-        if (firestoreError?.code == FirebaseFirestoreException.Code.UNAUTHENTICATED) {
-            onAuthInvalidated?.invoke("Your ALLORA session expired. Please sign in again.")
-            return
-        }
-        if (firestoreError?.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-            onVerifySessionRequested?.invoke()
-        }
-        _cloudSyncError.value = root.localizedMessage ?: "Cloud sync unavailable ($scopeLabel)"
+        if (error is CancellationException) throw error
+        Log.w(TAG, "Error observing $scopeLabel", error)
+        _cloudSyncError.value = error.localizedMessage ?: "Sync unavailable ($scopeLabel)"
     }
 
     fun dismissCloudSyncError() {
@@ -1336,9 +1325,10 @@ class AlloraViewModel(
         )
 
         val historyPairs = ConversationSerializer.normalizeHistoryPairs(
-            _chatMessages.value
+            historyPairs = _chatMessages.value
                 .filter { !it.isError && it.text.isNotBlank() && it.id != "msg-welcome" }
-                .map { it.isUser to it.text }
+                .map { it.isUser to it.text },
+            maxEntries = GroqSettings.MAX_HISTORY_MESSAGES
         )
 
         // Clean any interrupted streaming rows before starting a new request
@@ -1438,7 +1428,7 @@ class AlloraViewModel(
                         }
                         reply.createdTripId?.let { selectTrip(it) }
                         _orbState.value = OrbState.IDLE
-                        _aiStatusLabel.value = "Ready • Allora Gemini AI"
+                        _aiStatusLabel.value = "Ready • ${GroqSettings.MAIN_MODEL_DISPLAY_NAME}"
                         _aiChatState.value = AiChatState.IDLE
                         viewModelScope.launch {
                             delay(600L)
@@ -1486,7 +1476,7 @@ class AlloraViewModel(
                     _aiChatState.value = AiChatState.IDLE
                     _chatInterfaceState.value = AlloraChatInterfaceState.IDLE
                     _orbState.value = OrbState.IDLE
-                    _aiStatusLabel.value = "Ready • Allora Gemini AI"
+                    _aiStatusLabel.value = "Ready • ${GroqSettings.MAIN_MODEL_DISPLAY_NAME}"
                 }
                 throw ce
             } finally {
@@ -2333,9 +2323,10 @@ class AlloraViewModel(
 
         val assistantMsgId = "msg-a-$clientSubmissionId"
         val historyPairs = ConversationSerializer.normalizeHistoryPairs(
-            currentThreadMessages
+            historyPairs = currentThreadMessages
                 .filter { !it.isError && !it.isStreaming && it.plainText.isNotBlank() && !it.id.startsWith("msg-w") }
-                .map { it.isUser to it.plainText }
+                .map { it.isUser to it.plainText },
+            maxEntries = GroqSettings.MAX_HISTORY_MESSAGES
         )
 
         val placeholderMsg = AlloraRichMessage(
@@ -2380,10 +2371,6 @@ class AlloraViewModel(
         )
     }
 
-    fun requestSessionReverification() {
-        onVerifySessionRequested?.invoke()
-    }
-
     fun retryRichChatMessage(failedAssistantMessageId: String) {
         synchronized(submissionLock) {
             if (_isSendingMessage.value || _isRetryingMessage.value) {
@@ -2419,22 +2406,33 @@ class AlloraViewModel(
             .take(failedIndex)
             .lastOrNull { it.isUser }
 
+        val attachmentsToRetry = recorded?.attachments ?: fallbackUserMsg?.attachments.orEmpty()
         val promptToRetry = recorded?.prompt
             ?: fallbackUserMsg?.plainText?.takeIf { it.isNotBlank() }
+            ?: if (attachmentsToRetry.isNotEmpty()) {
+                if (attachmentsToRetry.any { it.isImage }) "What can you tell me about the attached photo?"
+                else "Summarize the attached file cleanly."
+            } else null
         if (promptToRetry == null) {
             _isSendingMessage.value = false
             _isRetryingMessage.value = false
             return
         }
-        val attachmentsToRetry = recorded?.attachments ?: fallbackUserMsg?.attachments.orEmpty()
         val quoteToRetry = recorded?.replyTo ?: fallbackUserMsg?.replyTo
 
+        com.example.data.ai.orchestrator.AiPipelineDiagnostics.logStage(
+            requestId = failedAssistantMessageId,
+            stage = "VM_RETRY_DISPATCH",
+            message = "threadLen=${targetThread.id.length} hasUid=${currentUserId.isNotBlank()} attachments=${attachmentsToRetry.size}"
+        )
+
         val historyPairs = ConversationSerializer.normalizeHistoryPairs(
-            targetThread.messages
+            historyPairs = targetThread.messages
                 .take(failedIndex)
                 .dropLastWhile { it.isUser && it.id == fallbackUserMsg?.id }
                 .filter { !it.isError && !it.isStreaming && it.plainText.isNotBlank() && !it.id.startsWith("msg-w") }
-                .map { it.isUser to it.plainText }
+                .map { it.isUser to it.plainText },
+            maxEntries = GroqSettings.MAX_HISTORY_MESSAGES
         )
 
         finalizeDanglingPlaceholder()
@@ -2567,6 +2565,11 @@ class AlloraViewModel(
             } else null
 
             try {
+                com.example.data.ai.orchestrator.AiPipelineDiagnostics.logStage(
+                    requestId = assistantMsgId,
+                    stage = "VM_INFERENCE_START",
+                    message = "hasUid=${currentUserId.isNotBlank()} isRetry=$isRetry history=${historyPairs.size} bitmaps=${bitmaps.size} hasFileCtx=${!fileContext.isNullOrBlank()}"
+                )
                 val liveBrowser = browserLiveActivity.value
                 val activeTask = autonomousTasks.value.firstOrNull {
                     it.status.isActiveExecution ||
@@ -2584,6 +2587,7 @@ class AlloraViewModel(
                     taskId = liveBrowser.taskId ?: activeTask?.taskId,
                     browserSessionId = liveBrowser.sessionId.takeIf { liveBrowser.active && it.isNotBlank() },
                     activeBrowserUrl = liveBrowser.currentUrl.takeIf { liveBrowser.active && it.isNotBlank() },
+                    isRetry = isRetry,
                     onTaskStep = { step ->
                         _chatLiveTaskStep.value = step
                         _aiStatusLabel.value = step
@@ -2688,8 +2692,14 @@ class AlloraViewModel(
                         }
                         reply.createdTripId?.let { selectTrip(it) }
                         _orbState.value = OrbState.IDLE
-                        _aiStatusLabel.value = "Ready • Allora Gemini AI"
+                        val selectedLabel = aiRequestManager.activeModelConfig.value?.displayName ?: "Allora AI"
+                        _aiStatusLabel.value = "Ready • $selectedLabel"
                         _aiChatState.value = AiChatState.IDLE
+                        com.example.data.ai.orchestrator.AiPipelineDiagnostics.logStage(
+                            requestId = assistantMsgId,
+                            stage = "VM_INFERENCE_SUCCESS",
+                            message = "model=$selectedLabel replyLen=${reply.plainText.length} blocks=${reply.blocks.size} traces=${reply.toolTraces.size}"
+                        )
                         viewModelScope.launch {
                             delay(600L)
                             _chatInterfaceState.compareAndSet(
@@ -2713,6 +2723,12 @@ class AlloraViewModel(
                         _aiStatusLabel.value = interfaceErrState.displayLabel
                         val errText = aiRequestManager.classifyUserFriendlyError(e)
                             .ifBlank { "Couldn't reach Allora right now. Tap Retry." }
+                        com.example.data.ai.orchestrator.AiPipelineDiagnostics.logStage(
+                            requestId = assistantMsgId,
+                            stage = "VM_INFERENCE_FAILURE",
+                            message = "uiState=$interfaceErrState errText=$errText cause=${com.example.data.ai.orchestrator.AiFailureClassifier.sanitizeExceptionChain(e)}",
+                            isError = true
+                        )
                         failedPromptsByAssistantId[assistantMsgId] = FailedChatPrompt(
                             threadId = tid,
                             prompt = promptToSend,
@@ -2749,7 +2765,7 @@ class AlloraViewModel(
                     _aiChatState.value = AiChatState.IDLE
                     _chatInterfaceState.value = AlloraChatInterfaceState.IDLE
                     _orbState.value = OrbState.IDLE
-                    _aiStatusLabel.value = "Ready • Allora Gemini AI"
+                    _aiStatusLabel.value = "Ready • ${GroqSettings.MAIN_MODEL_DISPLAY_NAME}"
                 }
                 throw ce
             } finally {
@@ -2777,7 +2793,7 @@ class AlloraViewModel(
         _chatInterfaceState.value = AlloraChatInterfaceState.IDLE
         _lastChatErrorCategory.value = null
         _orbState.value = OrbState.IDLE
-        _aiStatusLabel.value = "Ready • Allora Gemini AI"
+        _aiStatusLabel.value = "Ready • ${GroqSettings.MAIN_MODEL_DISPLAY_NAME}"
         _chatTypingState.value = false
         _chatLiveTaskStep.value = ""
         _replyingToMessage.value = null
@@ -2908,7 +2924,7 @@ class AlloraViewModel(
                     )
                 }
                 _orbState.value = OrbState.IDLE
-                _aiStatusLabel.value = "Ready • Allora Gemini AI"
+                _aiStatusLabel.value = "Ready • ${GroqSettings.MAIN_MODEL_DISPLAY_NAME}"
 
                 addNotification(
                     title = "AI Itinerary Saved",
@@ -3614,10 +3630,11 @@ class AlloraViewModel(
         val tid = _activeThreadId.value
         val currentMsgs = _richThreads.value.firstOrNull { it.id == tid }?.messages.orEmpty()
         return ConversationSerializer.normalizeHistoryPairs(
-            currentMsgs
+            historyPairs = currentMsgs
                 .filter { !it.isError && !it.isStreaming && it.plainText.isNotBlank() && !it.id.startsWith("msg-w") }
                 .map { it.isUser to it.plainText }
-                .takeLast(10)
+                .takeLast(GroqSettings.MAX_HISTORY_MESSAGES),
+            maxEntries = GroqSettings.MAX_HISTORY_MESSAGES
         )
     }
 
@@ -3776,19 +3793,6 @@ class AlloraViewModel(
 
     fun deleteWorkspaceNote(noteId: String) {
         viewModelScope.launch { taskEngine?.deleteWorkspaceNote(noteId) }
-    }
-
-    suspend fun prepareForSignOut() {
-        activeAiJob?.cancel()
-        landmarkAnalysisJob?.cancel()
-        onStopTrackingService?.invoke()
-        taskEngine?.haltAllExecutionForSignOut()
-        workspaceController?.prepareForSignOut()
-        stopFirestoreObservers()
-        withContext(Dispatchers.IO) {
-            database.bookingRecordDao().deleteBookingsForUser(currentUserId)
-            database.userPreferenceDao().deletePreferences(currentUserId)
-        }
     }
 
     fun setAiSelectionMode(mode: AiSelectionMode) {

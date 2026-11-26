@@ -54,7 +54,6 @@ import com.example.ui.components.rememberAlloraOrbSpringDriver
 import com.example.ui.components.toMotionProfile
 import com.example.ui.screens.AppearanceSelectorSection
 import com.example.ui.screens.HomeScreenContent
-import com.example.ui.screens.UnauthenticatedFlowScreen
 import com.example.ui.theme.AlloraTheme
 import com.example.ui.theme.ClearGlassDark
 import com.example.ui.theme.ClearGlassLight
@@ -353,22 +352,6 @@ class AlloraGlassUiTest {
     fun `home shows embedded computer card only when browser or task is active`() {
         renderHomeViewport(widthDp = 412.dp, heightDp = 892.dp, browserActive = true)
         assertHomeResponsiveLayout(isTablet = false, expectActiveComputerCard = true)
-    }
-
-    @Test
-    fun `onboarding renders ALLORA intro and skips to Google Sign In screen`() {
-        composeRule.setContent {
-            AlloraTheme(darkTheme = true) {
-                UnauthenticatedFlowScreen(
-                    initialShowOnboarding = true,
-                    onAuthenticated = {}
-                )
-            }
-        }
-
-        composeRule.onNodeWithTag("onboarding_next_button").assertIsDisplayed()
-        composeRule.onNodeWithTag("onboarding_skip_button").performClick()
-        composeRule.onNodeWithTag("google_sign_in_button").assertIsDisplayed()
     }
 
     @Test
@@ -704,7 +687,7 @@ class AlloraGlassUiTest {
 
         composeRule.setContent {
             AlloraTheme(darkTheme = false) {
-                AlloraAtmosphericBackground(mood = AtmosphereMood.AUTH) {
+                AlloraAtmosphericBackground(mood = AtmosphereMood.HOME) {
                     Box(modifier = Modifier.fillMaxSize()) {
                         GlassSearchBar(
                             query = searchQuery,
@@ -725,44 +708,5 @@ class AlloraGlassUiTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("light_search_bar").assertIsDisplayed()
         composeRule.onNodeWithText("Crystal Glass Modal").assertIsDisplayed()
-    }
-
-    @Test
-    fun `onboarding flow navigates cleanly across 3 beginner friendly steps to Start chat`() {
-        composeRule.setContent {
-            AlloraTheme(darkTheme = false) {
-                UnauthenticatedFlowScreen(
-                    initialShowOnboarding = true,
-                    onAuthenticated = {}
-                )
-            }
-        }
-
-        composeRule.waitForIdle()
-        composeRule.onNodeWithTag("onboarding_next_button").assertIsDisplayed()
-
-        // Step 0 -> Step 1 ("Tailor Your Companion")
-        composeRule.onNodeWithTag("onboarding_next_button").performClick()
-        composeRule.waitForIdle()
-
-        composeRule.onNodeWithText("Tailor Your Companion").assertIsDisplayed()
-        composeRule.onNodeWithText("How should ALLORA help?").assertIsDisplayed()
-        composeRule.onNodeWithText("Balanced & Friendly").assertIsDisplayed()
-        composeRule.onNodeWithText("Calm Wellness").assertIsDisplayed()
-        composeRule.onNodeWithText("Default Recommendation Tier").assertIsDisplayed()
-
-        composeRule.onNodeWithText("Calm Wellness").performClick()
-        composeRule.waitForIdle()
-
-        // Step 1 -> Step 2 ("Always Your Choice" + "Start chat")
-        composeRule.onNodeWithTag("onboarding_next_button").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Always Your Choice").assertIsDisplayed()
-        composeRule.onNodeWithText("Start chat").assertIsDisplayed()
-
-        // Tap Start chat -> Google Sign In
-        composeRule.onNodeWithTag("onboarding_next_button").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithTag("google_sign_in_button").assertIsDisplayed()
     }
 }

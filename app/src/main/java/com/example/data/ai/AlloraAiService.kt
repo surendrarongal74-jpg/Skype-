@@ -67,8 +67,7 @@ class AlloraAiService(
     private val unifiedToolRouter: AlloraUnifiedToolRouter? = null,
     private val aiRequestManager: AiRequestManager? = null,
     private val dynamicContextProvider: (suspend () -> String)? = null,
-    private val userIdProvider: () -> String = { "default" },
-    private val authTokenValidator: (suspend (String) -> Unit)? = null
+    private val userIdProvider: () -> String = { "allora_local_user" }
 ) {
 
     private val resolvedRequestManager: AiRequestManager by lazy {
@@ -171,11 +170,10 @@ class AlloraAiService(
         var lastCreatedTripId: String? = null
 
         return try {
-            val activeUserId = userIdProvider().ifBlank { "default" }
+            val activeUserId = resolveActiveUserId()
             val effectiveSystemPrompt = buildContextualSystemPrompt(assistantSystemPrompt)
             val finalText: String
             if (usesCustomTestGeminiBackend) {
-                authTokenValidator?.invoke(activeUserId)
                 val res = geminiBackend.streamPlainAssistantChat(
                     systemPrompt = effectiveSystemPrompt,
                     prompt = prompt,
@@ -244,6 +242,7 @@ class AlloraAiService(
         taskId: String? = null,
         browserSessionId: String? = null,
         activeBrowserUrl: String? = null,
+        isRetry: Boolean = false,
         onTaskStep: (String) -> Unit = {},
         onAiStatusPhase: (AiStatusPhase, String) -> Unit = { _, _ -> },
         onTextStream: (String) -> Unit = {},
@@ -285,12 +284,16 @@ class AlloraAiService(
         var lastCreatedTripId: String? = null
 
         return try {
-            val activeUserId = userIdProvider().ifBlank { "default" }
+            val activeUserId = resolveActiveUserId()
+            com.example.data.ai.orchestrator.AiPipelineDiagnostics.logStage(
+                requestId = if (isRetry) "svc_retry" else "svc_chat",
+                stage = "AI_SERVICE_DISPATCH",
+                message = "customTestBackend=$usesCustomTestGeminiBackend hasUser=${activeUserId != "default" && activeUserId.isNotBlank()} history=${historyPairs.size} bitmaps=${attachedBitmaps.size} isRetry=$isRetry"
+            )
             onTaskStep("Thinking with Allora...")
             val effectiveStructuredPrompt = buildContextualSystemPrompt(structuredSystemPrompt)
             val raw: String
             if (usesCustomTestGeminiBackend) {
-                authTokenValidator?.invoke(activeUserId)
                 val res = geminiBackend.streamStructuredChat(
                     systemPrompt = effectiveStructuredPrompt,
                     userPrompt = userPromptFull,
@@ -327,6 +330,7 @@ class AlloraAiService(
                     browserSessionId = browserSessionId,
                     activeTaskObjective = prompt.take(180),
                     activeBrowserUrl = activeBrowserUrl,
+                    isRetry = isRetry,
                     onStatusPhase = { phase, msg ->
                         onAiStatusPhase(phase, msg)
                         if (phase != AiStatusPhase.IDLE) {
@@ -384,7 +388,8 @@ class AlloraAiService(
             throw e
         } catch (e: Exception) {
             runCatching { Log.e(TAG, formatDiagnosticError("Structured chat failed", e)) }
-            val friendly = resolvedRequestManager.classifyUserFriendlyError(e, activeModelId)
+            val modelLabel = resolvedRequestManager.activeModelConfig.value?.displayName ?: activeModelId
+            val friendly = resolvedRequestManager.classifyUserFriendlyError(e, modelLabel)
             Result.failure(ClassifiedAiException(friendly, e))
         }
     }
@@ -830,9 +835,8 @@ class AlloraAiService(
             Return 5 to 6 crisp chronological itinerary stops across days 1 to 3 with realistic estimated costs and practical logistics notes.
         """.trimIndent()
 
-        val activeUserId = userIdProvider().ifBlank { "default" }
+        val activeUserId = resolveActiveUserId()
         val rawJson = if (usesCustomTestGeminiBackend) {
-            authTokenValidator?.invoke(activeUserId)
             geminiBackend.generateStructuredItineraryJson(
                 systemPrompt = "You are ALLORA's precision itinerary planner. Return strictly valid JSON adhering to the requested schema.",
                 prompt = prompt
@@ -897,6 +901,14 @@ class AlloraAiService(
         }
     }
 
+    private fun resolveActiveUserId(): String {
+        val provided = userIdProvider().trim()
+        if (provided.isNotBlank() && provided != "default") {
+            return provided
+        }
+        return resolvedRequestManager.resolveEffectiveUserId(provided)
+    }
+
     private fun humanReadableToolLabel(toolName: String): String = when (toolName) {
         TOOL_GET_WEATHER -> "Live Weather"
         TOOL_SEARCH_DESTINATIONS -> "Place Search"
@@ -950,9 +962,9 @@ class AlloraAiService(
 
     companion object {
         private const val TAG = "AlloraAiService"
-        const val DEFAULT_MODEL = "gemini-3.8-flash"
-        const val ITINERARY_MODEL = "gemini-3.8-flash"
-        private const val MAX_TOOL_ROUNDS = 5
+        const val DEFAULT_MODEL = GroqSettings.MAIN_MODEL
+        const val ITINERARY_MODEL = GroqSettings.MAIN_MODEL
+        private const val MAX_TOOL_ROUNDS = GroqSettings.MAX_TOOL_STEPS
 
         const val TOOL_GET_WEATHER = SharedToolCatalog.TOOL_GET_WEATHER
         const val TOOL_SEARCH_DESTINATIONS = SharedToolCatalog.TOOL_SEARCH_DESTINATIONS

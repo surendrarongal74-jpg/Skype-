@@ -3,7 +3,7 @@ package com.example.data.ai.orchestrator
 enum class AiProviderType(val displayName: String) {
     FIREBASE_AI("Firebase AI (Gemini)"),
     OPENROUTER("OpenRouter"),
-    OPENAI_COMPATIBLE("OpenAI Compatible"),
+    OPENAI_COMPATIBLE("Groq (OpenAI Compatible)"),
     ANTHROPIC_COMPATIBLE("Anthropic Compatible")
 }
 
@@ -265,8 +265,8 @@ data class AiRequestDiagnostics(
 
 data class AiUserPreferences(
     val selectionMode: AiSelectionMode = AiSelectionMode.AUTOMATIC,
-    val preferredModelId: String = "firebase_gemini_3_8_flash",
-    val manualModelId: String = "firebase_gemini_3_8_flash",
+    val preferredModelId: String = AiModelRegistry.ID_GROQ_GPT_OSS_120B,
+    val manualModelId: String = AiModelRegistry.ID_GROQ_GPT_OSS_120B,
     val autoSwitchOnFailure: Boolean = true
 )
 

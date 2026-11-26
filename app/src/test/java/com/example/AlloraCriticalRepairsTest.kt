@@ -190,7 +190,9 @@ class AlloraCriticalRepairsTest {
         }
 
         val models = listOf(
-            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
+            AiModelRegistry.defaultSeedModels()
+                .first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
+                .copy(enabled = true, priority = 10)
         )
         val orchestrator = AiModelOrchestrator(
             registry = AiModelRegistry(models),
@@ -276,7 +278,9 @@ class AlloraCriticalRepairsTest {
             }
         }
         val adapter = FirebaseAiProviderAdapter(executor)
-        val cfg = AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
+        val cfg = AiModelRegistry.defaultSeedModels()
+            .first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
+            .copy(enabled = true)
         val res = adapter.execute(
             config = cfg,
             request = UnifiedAiRequest(
@@ -392,7 +396,7 @@ class AlloraCriticalRepairsTest {
 
         val openAiConfig = AiModelRegistry.defaultSeedModels()
             .first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }
-            .copy(endpointUrl = mockServer.url("/v1/responses").toString())
+            .copy(enabled = true, endpointUrl = mockServer.url("/v1/responses").toString())
         val adapter = OpenAiCompatibleProviderAdapter(apiKeyResolver = { "sk-test-openai-direct-123" })
         val orchestrator = AiModelOrchestrator(
             registry = AiModelRegistry(listOf(openAiConfig)),
@@ -441,18 +445,30 @@ class AlloraCriticalRepairsTest {
     // ---- BUG 1D: OPENROUTER DISABLED BY DEFAULT ----
 
     @Test
-    fun `openrouter models are disabled by default and backup uses OpenAI Responses API`() {
+    fun `groq is primary active AI and legacy openai gemini and openrouter models are disabled by default`() {
         val seed = AiModelRegistry.defaultSeedModels()
         val openRouterModels = seed.filter { it.providerType == AiProviderType.OPENROUTER }
         assertTrue(openRouterModels.isNotEmpty())
         assertTrue("All OpenRouter models must be disabled in default runtime seed", openRouterModels.all { !it.enabled })
 
-        val primaryGemini = seed.first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
-        assertTrue(primaryGemini.enabled)
-        assertEquals(AiProviderType.FIREBASE_AI, primaryGemini.providerType)
+        val geminiModels = seed.filter { it.providerType == AiProviderType.FIREBASE_AI }
+        assertTrue(geminiModels.isNotEmpty())
+        assertTrue("All Google Gemini models must be disabled as main AI by default", geminiModels.all { !it.enabled })
 
-        val backupOpenAi = seed.first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }
-        assertEquals("https://api.openai.com/v1/responses", backupOpenAi.endpointUrl)
+        val primaryGroq = seed.first { it.modelId == AiModelRegistry.ID_GROQ_GPT_OSS_120B }
+        assertTrue(primaryGroq.enabled)
+        assertEquals(AiProviderType.OPENAI_COMPATIBLE, primaryGroq.providerType)
+        assertEquals("openai/gpt-oss-120b", primaryGroq.providerModelName)
+        assertEquals("https://api.groq.com/openai/v1/chat/completions", primaryGroq.endpointUrl)
+
+        val fallbackGroq = seed.first { it.modelId == AiModelRegistry.ID_GROQ_GPT_OSS_20B }
+        assertTrue(fallbackGroq.enabled)
+        assertEquals(AiProviderType.OPENAI_COMPATIBLE, fallbackGroq.providerType)
+        assertEquals("openai/gpt-oss-20b", fallbackGroq.providerModelName)
+        assertEquals("https://api.groq.com/openai/v1/chat/completions", fallbackGroq.endpointUrl)
+
+        val legacyOpenAi = seed.first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }
+        assertFalse(legacyOpenAi.enabled)
     }
 
     // ---- BUG 5 & BUG 6: INTELLIGENT TOOL FAILURE RECOVERY + SEPARATED AI/BROWSER PHASES ----
@@ -517,10 +533,16 @@ class AlloraCriticalRepairsTest {
         )
 
         val models = listOf(
-            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH },
-            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }.copy(
-                endpointUrl = mockServer.url("/v1/responses").toString()
-            )
+            AiModelRegistry.defaultSeedModels()
+                .first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
+                .copy(enabled = true, priority = 10),
+            AiModelRegistry.defaultSeedModels()
+                .first { it.modelId == AiModelRegistry.ID_OPENAI_GPT_4O_MINI }
+                .copy(
+                    enabled = true,
+                    priority = 20,
+                    endpointUrl = mockServer.url("/v1/responses").toString()
+                )
         )
         val openAiAdapter = OpenAiCompatibleProviderAdapter(apiKeyResolver = { "sk-backup-key-123" })
         val orchestrator = AiModelOrchestrator(

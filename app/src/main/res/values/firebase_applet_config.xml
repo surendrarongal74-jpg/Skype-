@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <resources>
-    <string name="firestore_database_id" translatable="false">ai-studio-android-skype-f18aa066-69da-450c-9ab5-f171d65c04c9</string>
-    <string name="recaptcha_site_key" translatable="false">6LeYnR0uAAAAAAuV0Zw2IVMM-AEl1Yru6_EuhNrG</string>
+    <string name="firestore_database_id" translatable="false">ai-studio-android-skype-3bf4362d-5ea6-4777-990c-09d5371247f3</string>
+    <string name="recaptcha_site_key" translatable="false">6LcmbSwuAAAAAMFsZN3T7b4a_fhrFHepiLfDSTAG</string>
 </resources>

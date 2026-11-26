@@ -3,10 +3,8 @@ package com.example.services
 import com.example.core.SecurityUtils
 import com.example.data.local.dao.EmailDao
 import com.example.data.local.entity.EmailItemEntity
-import com.google.firebase.Firebase
-import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.content
-import com.google.firebase.ai.type.generationConfig
+import com.example.data.ai.orchestrator.AiRequestManager
+import com.example.data.ai.orchestrator.AiTaskProfile
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -64,7 +62,7 @@ class EmailService(
     private val auditService: SecurityAuditService,
     private val notificationService: NotificationService,
     private val cloudSync: AgentCloudSyncPort? = null,
-    private val summarizer: EmailSummarizer = defaultGeminiEmailSummarizer(),
+    private val summarizer: EmailSummarizer = defaultOpenAiEmailSummarizer(),
     private val identityAuthService: IdentityAuthService? = null,
     private val timeProvider: () -> Long = { System.currentTimeMillis() }
 ) {
@@ -624,22 +622,19 @@ class EmailService(
             return "allora.$seg@workspace.allora.local"
         }
 
-        fun defaultGeminiEmailSummarizer(): EmailSummarizer = EmailSummarizer { subject, sender, body ->
+        fun defaultOpenAiEmailSummarizer(): EmailSummarizer = EmailSummarizer { subject, sender, body ->
             val fallback = buildExtractiveSummary(subject, sender, body)
             runCatching {
-                val model = Firebase.ai.generativeModel(
-                    modelName = "gemini-2.5-flash",
-                    generationConfig = generationConfig {
-                        temperature = 0.2f
-                        maxOutputTokens = 240
-                    }
-                )
                 withTimeout(12_000L) {
-                    model.generateContent(
-                        content("user") {
-                            text("Summarize this authorized email in 2 concise sentences without repeating secrets or codes:\nFrom: $sender\nSubject: $subject\nBody:\n${body.take(2500)}")
-                        }
-                    ).text?.trim().takeIf { !it.isNullOrBlank() } ?: fallback
+                    val res = AiRequestManager.getInstance().runChatTurn(
+                        taskProfile = AiTaskProfile.SIMPLE_CHAT,
+                        systemPrompt = "You summarize authorized emails concisely in 2 sentences without repeating secrets or codes.",
+                        userPrompt = "Summarize this authorized email in 2 concise sentences without repeating secrets or codes:\nFrom: $sender\nSubject: $subject\nBody:\n${body.take(2500)}",
+                        historyPairs = emptyList(),
+                        temperature = 0.2,
+                        maxTokens = 240
+                    )
+                    res.text.trim().takeIf { it.isNotBlank() } ?: fallback
                 }
             }.getOrDefault(fallback)
         }

@@ -22,7 +22,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bookmark
@@ -66,8 +65,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.credentials.CredentialManager
-import com.example.core.signOutFromAllora
 import com.example.data.local.AppearanceMode
 import com.example.ui.components.AlloraWrapRow
 import com.example.ui.components.GlassButton
@@ -101,13 +98,9 @@ import kotlin.math.roundToInt
 fun ProfileSettingsScreen(
     viewModel: AlloraViewModel,
     onNavigateSub: (SubDestination) -> Unit,
-    modifier: Modifier = Modifier,
-    onSignOutRequested: (() -> Unit)? = null
+    modifier: Modifier = Modifier
 ) {
     val glass = LocalAlloraGlassColors.current
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-    val credentialManager = remember(context) { CredentialManager.create(context) }
 
     val profile by viewModel.userProfile.collectAsState()
     val email by viewModel.userEmail.collectAsState()
@@ -163,7 +156,7 @@ fun ProfileSettingsScreen(
                     Spacer(modifier = Modifier.width(14.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(profile.displayName, style = MaterialTheme.typography.titleLarge.copy(color = glass.textPrimary))
-                        Text(email.ifBlank { "Google Account Connected" }, style = MaterialTheme.typography.bodySmall.copy(color = glass.textSecondary))
+                        Text(email.ifBlank { "Personal Local Space" }, style = MaterialTheme.typography.bodySmall.copy(color = glass.textSecondary))
                         Spacer(modifier = Modifier.height(6.dp))
                         StatusGlassPill(label = selectedPreset.displayName, color = glass.accentPrimary)
                     }
@@ -320,7 +313,7 @@ fun ProfileSettingsScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
                 GlassButton(
-                    text = if (showSavedFeedback) "Saved to Room & Cloud ✓" else "Save Preferences",
+                    text = if (showSavedFeedback) "Saved ✓" else "Save Preferences",
                     onClick = {
                         viewModel.updateUserProfile(
                             profile.copy(
@@ -404,34 +397,13 @@ fun ProfileSettingsScreen(
             }
         }
 
-        item {
-            GlassButton(
-                text = "Sign Out of ALLORA",
-                onClick = {
-                    if (onSignOutRequested != null) {
-                        onSignOutRequested()
-                    } else {
-                        coroutineScope.launch {
-                            viewModel.prepareForSignOut()
-                            signOutFromAllora(credentialManager = credentialManager, scope = coroutineScope)
-                        }
-                    }
-                },
-                isPrimary = false,
-                material = GlassMaterial.CLEAR,
-                leadingIcon = Icons.AutoMirrored.Filled.Logout,
-                accentColor = glass.statusError,
-                testTag = "profile_sign_out_button",
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
     }
 
     if (showClearCacheConfirm) {
         GlassModal(onDismissRequest = { showClearCacheConfirm = false }) {
             Text("Refresh Offline Room Cache?", style = MaterialTheme.typography.titleLarge.copy(color = glass.textPrimary))
             Spacer(modifier = Modifier.height(8.dp))
-            Text("Clears local offline booking records while keeping your cloud Firestore vault intact.", style = MaterialTheme.typography.bodySmall.copy(color = glass.textSecondary))
+            Text("Clears local offline booking records.", style = MaterialTheme.typography.bodySmall.copy(color = glass.textSecondary))
             Spacer(modifier = Modifier.height(14.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                 GlassButton(text = "Cancel", onClick = { showClearCacheConfirm = false }, isPrimary = false, material = GlassMaterial.CLEAR, modifier = Modifier.weight(1f))

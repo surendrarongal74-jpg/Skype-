@@ -3,9 +3,6 @@ package com.example.data.ai.orchestrator
 import com.google.firebase.FirebaseNetworkException
 import com.google.firebase.ai.type.PromptBlockedException
 import com.google.firebase.ai.type.ResponseStoppedException
-import com.google.firebase.auth.FirebaseAuthException
-import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
-import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import java.io.IOException
@@ -19,6 +16,7 @@ object AiFailureClassifier {
 
     private val bearerRegex = Regex("""(?i)\bbearer\s+[A-Za-z0-9\-._~+/]+=*""")
     private val openAiKeyRegex = Regex("""\bsk-[A-Za-z0-9_\-]{12,}""")
+    private val groqKeyRegex = Regex("""\bgsk_[A-Za-z0-9_\-]{12,}""")
     private val googleKeyRegex = Regex("""\bAIza[0-9A-Za-z\-_]{16,}""")
     private val whitespaceRegex = Regex("""\s+""")
 
@@ -27,10 +25,23 @@ object AiFailureClassifier {
         return raw
             .replace(bearerRegex, "Bearer [REDACTED]")
             .replace(openAiKeyRegex, "sk-[REDACTED]")
+            .replace(groqKeyRegex, "gsk_[REDACTED]")
             .replace(googleKeyRegex, "AIza[REDACTED]")
             .replace(whitespaceRegex, " ")
             .trim()
             .take(maxLength)
+    }
+
+    fun sanitizeExceptionChain(error: Throwable, maxLength: Int = 220): String {
+        val parts = generateSequence(error) { it.cause }
+            .take(4)
+            .mapNotNull { ex ->
+                val msg = sanitizeDetail(ex.message.orEmpty(), 120)
+                if (msg.isBlank()) ex::class.java.simpleName
+                else "${ex::class.java.simpleName}: $msg"
+            }
+            .toList()
+        return sanitizeDetail(parts.joinToString(" <- "), maxLength)
     }
 
     fun toProviderException(
@@ -57,8 +68,9 @@ object AiFailureClassifier {
         }
 
         val chain = generateSequence(error) { it.cause }.toList()
+        val classNames = chain.joinToString(" | ") { it::class.java.simpleName.lowercase() }
         val combined = chain.mapNotNull { it.message?.lowercase() }.joinToString(" | ")
-        val detail = sanitizeDetail(error.localizedMessage.orEmpty()).ifBlank { "AI request failed." }
+        val detail = sanitizeExceptionChain(error, 200).ifBlank { "AI request failed." }
 
         val category = when {
             isFirebaseAuthExpiredChain(chain, combined) ->
@@ -88,6 +100,12 @@ object AiFailureClassifier {
             combined.contains("stream") && (combined.contains("interrupt") || combined.contains("closed") || combined.contains("abort")) ->
                 AiFailureCategory.STREAM_INTERRUPTED
 
+            combined.contains("insufficient_quota") ||
+                combined.contains("billing") ||
+                combined.contains("blaze") ||
+                classNames.contains("quotaexceeded") ->
+                AiFailureCategory.PAYMENT_OR_QUOTA
+
             combined.contains("429") || combined.contains("rate limit") || combined.contains("resource exhausted") || combined.contains("too many requests") ->
                 AiFailureCategory.RATE_LIMIT_429
 
@@ -97,8 +115,11 @@ object AiFailureClassifier {
             ConversationSerializer.isRoleCompatibilityErrorMessage(combined) ||
                 combined.contains("invalid_request") ||
                 combined.contains("invalid request") ||
+                combined.contains("invalid argument") ||
+                combined.contains("invalid schema") ||
                 combined.contains("bad request") ||
-                combined.contains("http 400") ->
+                combined.contains("http 400") ||
+                classNames.contains("invalidstate") ->
                 AiFailureCategory.INVALID_REQUEST
 
             // Check App Check / provider key / HTTP 401/403 BEFORE generic permission denied so
@@ -111,7 +132,14 @@ object AiFailureClassifier {
                 combined.contains("unauthenticated") ||
                 combined.contains("unauthorized") ||
                 combined.contains("invalid_api_key") ||
-                combined.contains("api key") ->
+                combined.contains("api_key_service_blocked") ||
+                combined.contains("requests to this api") ||
+                (combined.contains("are blocked") && (combined.contains("api") || combined.contains("service") || combined.contains("firebasevertexai"))) ||
+                combined.contains("permission denied on the service") ||
+                combined.contains("api key") ||
+                combined.contains("api has not been used") ||
+                combined.contains("api is not enabled") ||
+                classNames.contains("invalidapikey") ->
                 AiFailureCategory.AUTH_OR_KEY_ERROR
 
             chain.any { it is SecurityException } ||
@@ -123,11 +151,24 @@ object AiFailureClassifier {
 
             combined.contains("404") ||
                 (combined.contains("model") &&
-                    (combined.contains("not found") || combined.contains("not enabled") || combined.contains("unsupported") || combined.contains("deprecated"))) ->
+                    (combined.contains("not found") ||
+                        combined.contains("not enabled") ||
+                        combined.contains("unsupported") ||
+                        combined.contains("unavailable") ||
+                        combined.contains("deprecated"))) ->
                 AiFailureCategory.MODEL_NOT_FOUND
 
-            combined.contains("500") || combined.contains("502") || combined.contains("503") ||
-                combined.contains("unavailable") || combined.contains("overloaded") ->
+            classNames.contains("serviceunavailable") ||
+                combined.contains("500") ||
+                combined.contains("502") ||
+                combined.contains("503") ||
+                combined.contains("504") ||
+                combined.contains("service unavailable") ||
+                combined.contains("provider unavailable") ||
+                combined.contains("temporarily overloaded") ||
+                combined.contains("overloaded") ||
+                combined.contains("bad gateway") ||
+                combined.contains("gateway timeout") ->
                 AiFailureCategory.SERVER_ERROR_5XX
 
             chain.any { it is PromptBlockedException || it is ResponseStoppedException } ||
@@ -174,7 +215,7 @@ object AiFailureClassifier {
             AiFailureCategory.AUTH_EXPIRED -> AlloraChatInterfaceState.AUTHENTICATION_FAILURE
             AiFailureCategory.AUTH_OR_KEY_ERROR -> {
                 val combined = chain.mapNotNull { it.message?.lowercase() }.joinToString(" | ")
-                if (combined.contains("firebase") || combined.contains("sign in") || combined.contains("session")) {
+                if (combined.contains("sign in") || combined.contains("session")) {
                     AlloraChatInterfaceState.AUTHENTICATION_FAILURE
                 } else {
                     AlloraChatInterfaceState.PROVIDER_UNAVAILABLE
@@ -198,20 +239,6 @@ object AiFailureClassifier {
     }
 
     private fun isFirebaseAuthExpiredChain(chain: List<Throwable>, combined: String): Boolean {
-        if (chain.any { it is FirebaseAuthInvalidUserException || it is FirebaseAuthInvalidCredentialsException }) {
-            return true
-        }
-        if (chain.any { ex ->
-                ex is FirebaseAuthException && (
-                    ex.errorCode.equals("ERROR_USER_TOKEN_EXPIRED", ignoreCase = true) ||
-                        ex.errorCode.equals("ERROR_INVALID_USER_TOKEN", ignoreCase = true) ||
-                        ex.errorCode.equals("ERROR_USER_DISABLED", ignoreCase = true) ||
-                        ex.errorCode.equals("ERROR_USER_NOT_FOUND", ignoreCase = true)
-                    )
-            }
-        ) {
-            return true
-        }
         return combined.contains("user-token-expired") ||
             combined.contains("token expired") ||
             combined.contains("id token expired") ||

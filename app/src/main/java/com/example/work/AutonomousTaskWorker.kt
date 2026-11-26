@@ -13,16 +13,13 @@ import androidx.work.workDataOf
 import com.example.agent.AgentTaskStatus
 import com.example.agent.TaskExecutionEngine
 import com.example.data.local.AlloraDatabase
-import com.example.data.remote.AutonomousTaskFirestoreStore
+import com.example.data.remote.LocalAutonomousTaskCloudStore
 import com.example.data.repository.GeospatialRepository
 import com.example.data.repository.WeatherRepository
 import com.example.live.LiveSessionController
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
 
 /**
  * WorkManager worker for eligible deferrable autonomous research/prep tasks.
- * Verifies the active Firebase UID matches the task's owner before resuming any checkpoint.
  */
 class AutonomousTaskWorker(
     appContext: Context,
@@ -36,19 +33,13 @@ class AutonomousTaskWorker(
             return Result.failure()
         }
 
-        val signedInUid = runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
-        if (signedInUid != expectedUid) {
-            Log.w(TAG, "Skipping background task $taskId because signed-in user changed or signed out.")
-            return Result.failure()
-        }
-
         val appCtx = applicationContext
         val db = AlloraDatabase.getInstance(appCtx)
         val liveController = LiveSessionController.getInstance(appCtx)
         val engine = TaskExecutionEngine.createDefault(
             appContext = appCtx,
             database = db,
-            cloudStore = runCatching { AutonomousTaskFirestoreStore(appCtx) }.getOrNull(),
+            cloudStore = LocalAutonomousTaskCloudStore(),
             weatherRepo = WeatherRepository.createDefault(),
             geospatialRepo = GeospatialRepository.createDefault(),
             permissionManager = liveController.permissionManager,

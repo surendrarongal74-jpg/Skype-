@@ -142,15 +142,15 @@ class AiPipelineRoleCompatibilityIntegrationTest {
             AiProviderType.FIREBASE_AI to FirebaseAiProviderAdapter(geminiExecutor),
             AiProviderType.OPENROUTER to OpenRouterProviderAdapter(openRouterClient)
         )
-        val testRegistry = if (openRouterApiKey.isNotBlank()) {
-            AiModelRegistry(
-                AiModelRegistry.defaultSeedModels().map {
-                    if (it.modelId == AiModelRegistry.ID_OPENROUTER_GEMINI_FLASH) it.copy(enabled = true) else it
+        val testRegistry = AiModelRegistry(
+            AiModelRegistry.defaultSeedModels().map {
+                when {
+                    it.providerType == AiProviderType.FIREBASE_AI -> it.copy(enabled = true)
+                    openRouterApiKey.isNotBlank() && it.modelId == AiModelRegistry.ID_OPENROUTER_GEMINI_FLASH -> it.copy(enabled = true)
+                    else -> it
                 }
-            )
-        } else {
-            AiModelRegistry()
-        }
+            }
+        )
         val orchestrator = AiModelOrchestrator(
             registry = testRegistry,
             adapters = adapters,
@@ -501,7 +501,7 @@ class AiPipelineRoleCompatibilityIntegrationTest {
             apiKeyProvider = { "sk-or-test-key" }
         )
         val models = listOf(
-            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH },
+            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }.copy(enabled = true),
             AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_OPENROUTER_GEMINI_FLASH }.copy(enabled = true)
         )
         val orchestrator = AiModelOrchestrator(
@@ -687,6 +687,13 @@ class AiPipelineRoleCompatibilityIntegrationTest {
         }
 
         val orchestrator = AiModelOrchestrator(
+            registry = AiModelRegistry(
+                listOf(
+                    AiModelRegistry.defaultSeedModels()
+                        .first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }
+                        .copy(enabled = true)
+                )
+            ),
             adapters = mapOf(AiProviderType.FIREBASE_AI to FirebaseAiProviderAdapter(geminiExecutor)),
             sleepFn = {}
         )
@@ -875,8 +882,8 @@ class AiPipelineRoleCompatibilityIntegrationTest {
         val sideEffectExecCount = AtomicInteger(0)
         val callCount = AtomicInteger(0)
         val models = listOf(
-            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH },
-            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_5_LITE }
+            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_8_FLASH }.copy(enabled = true),
+            AiModelRegistry.defaultSeedModels().first { it.modelId == AiModelRegistry.ID_FIREBASE_GEMINI_3_5_LITE }.copy(enabled = true)
         )
         val orchestrator = AiModelOrchestrator(
             registry = AiModelRegistry(models),

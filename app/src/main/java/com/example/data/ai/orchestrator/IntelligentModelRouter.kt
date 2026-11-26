@@ -3,7 +3,8 @@ package com.example.data.ai.orchestrator
 data class RoutingPlan(
     val orderedCandidates: List<AiModelConfig>,
     val manualModeBlockedReason: String? = null,
-    val recommendedAlternative: AiModelConfig? = null
+    val recommendedAlternative: AiModelConfig? = null,
+    val skippedModels: List<String> = emptyList()
 )
 
 /**
@@ -24,14 +25,39 @@ class IntelligentModelRouter(
         nowMs: Long = System.currentTimeMillis()
     ): RoutingPlan {
         val requiredCaps = taskProfile.requiredCapabilities + extraRequiredCapabilities
+        val skippedReasons = mutableListOf<String>()
         val allConfigured = registry.getAllModels().filter { cfg ->
-            cfg.enabled &&
-                cfg.contextWindowTokens >= estimatedPromptTokens &&
-                adapters[cfg.providerType]?.isConfiguredForModel(cfg) == true
+            val adapter = adapters[cfg.providerType]
+            when {
+                !cfg.enabled -> {
+                    skippedReasons.add("${cfg.displayName}: disabled")
+                    false
+                }
+                cfg.contextWindowTokens < estimatedPromptTokens -> {
+                    skippedReasons.add("${cfg.displayName}: context window ${cfg.contextWindowTokens} < $estimatedPromptTokens")
+                    false
+                }
+                adapter == null -> {
+                    skippedReasons.add("${cfg.displayName}: no adapter for ${cfg.providerType}")
+                    false
+                }
+                !adapter.isConfiguredForModel(cfg) -> {
+                    val detail = (adapter as? OpenAiCompatibleProviderAdapter)?.diagnosticConfigStatus(cfg)
+                        ?: "provider credentials not configured"
+                    skippedReasons.add("${cfg.displayName}: $detail")
+                    false
+                }
+                else -> true
+            }
         }
 
         val compatible = allConfigured.filter { cfg ->
-            cfg.capabilities.containsAll(requiredCaps)
+            val hasCaps = cfg.capabilities.containsAll(requiredCaps)
+            if (!hasCaps) {
+                val missing = (requiredCaps - cfg.capabilities).joinToString { it.label }
+                skippedReasons.add("${cfg.displayName}: missing capability ($missing)")
+            }
+            hasCaps
         }
 
         val rankedAllCompatible = scoreAndSort(
@@ -77,13 +103,15 @@ class IntelligentModelRouter(
                     RoutingPlan(
                         orderedCandidates = emptyList(),
                         manualModeBlockedReason = unavailableReason,
-                        recommendedAlternative = recommended
+                        recommendedAlternative = recommended,
+                        skippedModels = skippedReasons
                     )
                 } else if (unavailableReason != null) {
                     // User allowed auto-switch despite manual selection
                     RoutingPlan(
                         orderedCandidates = automaticOrder,
-                        recommendedAlternative = recommended
+                        recommendedAlternative = recommended,
+                        skippedModels = skippedReasons
                     )
                 } else if (chosen != null) {
                     val list = if (userPreferences.autoSwitchOnFailure) {
@@ -93,10 +121,14 @@ class IntelligentModelRouter(
                     }
                     RoutingPlan(
                         orderedCandidates = list,
-                        recommendedAlternative = recommended
+                        recommendedAlternative = recommended,
+                        skippedModels = skippedReasons
                     )
                 } else {
-                    RoutingPlan(orderedCandidates = automaticOrder)
+                    RoutingPlan(
+                        orderedCandidates = automaticOrder,
+                        skippedModels = skippedReasons
+                    )
                 }
             }
 
@@ -111,14 +143,16 @@ class IntelligentModelRouter(
                 }
                 RoutingPlan(
                     orderedCandidates = ordered,
-                    recommendedAlternative = automaticOrder.firstOrNull()
+                    recommendedAlternative = automaticOrder.firstOrNull(),
+                    skippedModels = skippedReasons
                 )
             }
 
             AiSelectionMode.AUTOMATIC -> {
                 RoutingPlan(
                     orderedCandidates = automaticOrder,
-                    recommendedAlternative = automaticOrder.drop(1).firstOrNull()
+                    recommendedAlternative = automaticOrder.drop(1).firstOrNull(),
+                    skippedModels = skippedReasons
                 )
             }
         }

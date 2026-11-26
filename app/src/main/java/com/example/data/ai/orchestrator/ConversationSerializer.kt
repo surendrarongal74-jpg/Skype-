@@ -16,9 +16,12 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -422,7 +425,8 @@ object ConversationSerializer {
         stream: Boolean = true,
         responseFormatName: String? = null,
         responseFormatSchema: JsonObject? = null,
-        previousResponseId: String? = null
+        previousResponseId: String? = null,
+        enableWebSearch: Boolean = false
     ): JsonObject {
         val conv = normalizeConversation(systemPrompt, messages)
         val anchorIdx = if (!previousResponseId.isNullOrBlank()) {
@@ -516,7 +520,7 @@ object ConversationSerializer {
             }
             put("input", inputItems)
             put("temperature", temperature)
-            put("max_output_tokens", maxTokens)
+            put("max_output_tokens", maxTokens.coerceAtLeast(16))
             put("stream", stream)
             if (tools.isNotEmpty()) {
                 putJsonArray("tools") {
@@ -526,21 +530,53 @@ object ConversationSerializer {
                             put("name", spec.name)
                             put("description", spec.description)
                             put("parameters", spec.parametersSchema)
+                            put("strict", false)
                         }
                     }
                 }
                 put("tool_choice", "auto")
+            } else if (enableWebSearch) {
+                putJsonArray("tools") {
+                    addJsonObject {
+                        put("type", "web_search_preview")
+                    }
+                }
             }
             if (responseFormatSchema != null && !responseFormatName.isNullOrBlank()) {
                 putJsonObject("text") {
                     putJsonObject("format") {
                         put("type", "json_schema")
                         put("name", responseFormatName)
-                        put("strict", true)
+                        put("strict", isOpenAiStrictSchema(responseFormatSchema))
                         put("schema", responseFormatSchema)
                     }
                 }
             }
+        }
+    }
+
+    internal fun isOpenAiStrictSchema(schema: JsonObject): Boolean {
+        val type = schema["type"]?.jsonPrimitive?.contentOrNull
+        return when (type) {
+            "object" -> {
+                val additional = schema["additionalProperties"]?.jsonPrimitive?.booleanOrNull
+                if (additional != false) return false
+                val props = schema["properties"] as? JsonObject ?: return true
+                val requiredSet = (schema["required"] as? JsonArray)
+                    ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                    ?.toSet()
+                    ?: emptySet()
+                if (!props.keys.all { it in requiredSet }) return false
+                props.values.all { elem ->
+                    val child = elem as? JsonObject ?: return@all true
+                    isOpenAiStrictSchema(child)
+                }
+            }
+            "array" -> {
+                val items = schema["items"] as? JsonObject ?: return true
+                isOpenAiStrictSchema(items)
+            }
+            else -> true
         }
     }
 

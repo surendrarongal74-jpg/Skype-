@@ -18,7 +18,6 @@ import com.example.data.local.entity.UserNotificationEntity
 import com.example.data.local.entity.WalletAccountEntity
 import com.example.data.local.entity.WalletTransactionEntity
 import com.example.data.local.entity.WorkspaceFileEntity
-import com.example.data.remote.AlloraAgentCloudStore
 import com.example.services.AgentCapability
 import com.example.services.AuditCategory
 import com.example.services.AuditOutcome
@@ -48,9 +47,9 @@ import com.example.services.TrustedPaymentProviderClient
 import com.example.services.UserIdentitySnapshot
 import com.example.services.UserWorkspaceService
 import com.example.services.VerificationChallengeState
+import com.example.services.AgentCloudSyncPort
+import com.example.services.NoOpAgentCloudSyncPort
 import com.example.services.WalletService
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -64,15 +63,15 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * Coordinates the user-isolated Wallet, Email, Browser, Permission, Workspace, Security Audit,
- * and Notification services for a single authenticated Firebase UID.
+ * Coordinates the Wallet, Email, Browser, Permission, Workspace, Security Audit,
+ * and Notification services for the local workspace user.
  */
 class AlloraAgentWorkspaceController(
     private val appContext: Context,
     val currentUserId: String,
     val userEmail: String,
     val database: AlloraDatabase,
-    val cloudStore: AlloraAgentCloudStore?,
+    val cloudStore: AgentCloudSyncPort?,
     val auditService: SecurityAuditService,
     val permissionService: PermissionService,
     val workspaceService: UserWorkspaceService,
@@ -766,11 +765,9 @@ class AlloraAgentWorkspaceController(
             appContext: Context,
             userId: String,
             userEmail: String,
-            database: AlloraDatabase,
-            firestore: FirebaseFirestore,
-            auth: FirebaseAuth
+            database: AlloraDatabase
         ): AlloraAgentWorkspaceController {
-            val cloudStore = AlloraAgentCloudStore(firestore, auth)
+            val cloudStore: AgentCloudSyncPort = NoOpAgentCloudSyncPort
             val auditService = SecurityAuditService(database.securityAuditDao(), cloudStore)
             val permissionService = PermissionService(database.permissionPolicyDao(), auditService, cloudStore)
             val workspaceService = UserWorkspaceService(appContext, database.workspaceFileDao(), auditService, cloudStore)

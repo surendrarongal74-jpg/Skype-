@@ -40,7 +40,6 @@ enum class AtmosphereMood {
     TRIPS,
     APPROVALS,
     ASSISTANT,
-    AUTH,
     MAP
 }
 

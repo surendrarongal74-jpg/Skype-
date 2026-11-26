@@ -162,20 +162,26 @@ data class OpenRouterResponse(
 
 class OpenRouterClient(
     val chatCompletionsUrl: String = DEFAULT_CHAT_COMPLETIONS_URL,
-    private val apiKeyProvider: () -> String = { BuildConfig.OPENROUTER_API_KEY },
-    private val httpClient: OkHttpClient = sharedHttpClient
+    private val apiKeyProvider: () -> String = { "" },
+    private val httpClient: OkHttpClient = sharedHttpClient,
+    private val defaultProviderId: String = AiProviderType.OPENROUTER.name
 ) {
 
     fun hasConfiguredApiKey(): Boolean {
         val key = apiKeyProvider().trim()
-        return key.isNotBlank() && key != "YOUR_OPENROUTER_API_KEY"
+        return key.isNotBlank() && !key.startsWith("YOUR_")
     }
 
     fun requireApiKey(): String {
         val key = apiKeyProvider().trim()
-        if (key.isBlank() || key == "YOUR_OPENROUTER_API_KEY") {
+        if (key.isBlank() || key.startsWith("YOUR_")) {
+            val envName = if (defaultProviderId == AiProviderType.OPENAI_COMPATIBLE.name) {
+                "GROQ_API_KEY"
+            } else {
+                "OPENROUTER_API_KEY"
+            }
             throw IllegalStateException(
-                "OPENROUTER_API_KEY is not configured. Add your OpenRouter API key in the AI Studio Secrets panel."
+                "$envName is not configured. Add $envName in the AI Studio Secrets panel."
             )
         }
         return key
@@ -209,7 +215,7 @@ class OpenRouterClient(
             )
         }
 
-        val request = buildHttpRequest(apiKey, payload)
+        val request = buildHttpRequest(apiKey, payload, includeOpenRouterExtensions)
         return try {
             withTimeout(timeoutMs) {
                 executeSuspend(request)
@@ -219,7 +225,7 @@ class OpenRouterClient(
         } catch (te: TimeoutCancellationException) {
             throw te
         } catch (e: Exception) {
-            runCatching { Log.e(TAG, "OpenRouter request failed for model $model (${e::class.java.simpleName})") }
+            runCatching { Log.e(TAG, "Chat completion failed for model $model (${e::class.java.simpleName})") }
             throw e
         }
     }
@@ -251,7 +257,7 @@ class OpenRouterClient(
             )
         }
 
-        val request = buildHttpRequest(apiKey, payload)
+        val request = buildHttpRequest(apiKey, payload, includeOpenRouterExtensions)
         return try {
             withTimeout(timeoutMs) {
                 executeStreamingSuspend(request, onTextDelta)
@@ -261,17 +267,25 @@ class OpenRouterClient(
         } catch (te: TimeoutCancellationException) {
             throw te
         } catch (e: Exception) {
-            runCatching { Log.e(TAG, "OpenRouter streaming failed for model $model (${e::class.java.simpleName})") }
+            runCatching { Log.e(TAG, "Chat streaming failed for model $model (${e::class.java.simpleName})") }
             throw e
         }
     }
 
-    private fun buildHttpRequest(apiKey: String, payload: String): Request =
+    private fun buildHttpRequest(
+        apiKey: String,
+        payload: String,
+        includeOpenRouterExtensions: Boolean
+    ): Request =
         Request.Builder()
             .url(chatCompletionsUrl)
             .header("Authorization", "Bearer $apiKey")
-            .header("HTTP-Referer", APP_REFERER)
-            .header("X-Title", APP_TITLE)
+            .apply {
+                if (includeOpenRouterExtensions) {
+                    header("HTTP-Referer", APP_REFERER)
+                    header("X-Title", APP_TITLE)
+                }
+            }
             .header("Content-Type", "application/json")
             .post(payload.toRequestBody(JSON_MEDIA_TYPE))
             .build()
@@ -335,7 +349,7 @@ class OpenRouterClient(
 
                 val body = res.body ?: throw AiProviderException(
                     category = AiFailureCategory.INVALID_RESPONSE,
-                    providerId = AiProviderType.OPENROUTER.name,
+                    providerId = defaultProviderId,
                     message = "AI endpoint returned an empty stream body."
                 )
                 val contentType = res.header("Content-Type").orEmpty()
@@ -382,7 +396,7 @@ class OpenRouterClient(
                         throw AiProviderException(
                             category = category,
                             statusCode = errCode,
-                            providerId = AiProviderType.OPENROUTER.name,
+                            providerId = defaultProviderId,
                             modelId = resolvedModel,
                             message = errMsg
                         )
@@ -404,9 +418,9 @@ class OpenRouterClient(
                     }
 
                     val deltaToolCalls = payloadObj?.get("tool_calls") as? JsonArray
-                    deltaToolCalls?.forEach { elem ->
-                        val tcObj = elem as? JsonObject ?: return@forEach
-                        val idx = tcObj["index"]?.jsonPrimitive?.intOrNull ?: 0
+                    deltaToolCalls?.forEachIndexed { deltaIdx, elem ->
+                        val tcObj = elem as? JsonObject ?: return@forEachIndexed
+                        val idx = tcObj["index"]?.jsonPrimitive?.intOrNull ?: deltaIdx
                         val acc = toolAccumulators.getOrPut(idx) { ToolCallAccumulator(idx) }
                         tcObj["id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { acc.id = it }
                         val fn = tcObj["function"] as? JsonObject
@@ -446,7 +460,7 @@ class OpenRouterClient(
                         } else {
                             AiFailureCategory.INVALID_RESPONSE
                         },
-                        providerId = AiProviderType.OPENROUTER.name,
+                        providerId = defaultProviderId,
                         modelId = resolvedModel,
                         message = msg
                     )
@@ -504,7 +518,10 @@ class OpenRouterClient(
                     put("type", "json_schema")
                     putJsonObject("json_schema") {
                         put("name", responseFormatName)
-                        put("strict", true)
+                        put(
+                            "strict",
+                            com.example.data.ai.orchestrator.ConversationSerializer.isOpenAiStrictSchema(responseFormatSchema)
+                        )
                         put("schema", responseFormatSchema)
                     }
                 }
@@ -665,7 +682,7 @@ class OpenRouterClient(
             statusCode = statusCode,
             retryAfterMs = retryAfterMs,
             retryable = category.shouldTriggerFailover,
-            providerId = AiProviderType.OPENROUTER.name,
+            providerId = defaultProviderId,
             message = message
         )
     }
@@ -675,7 +692,7 @@ class OpenRouterClient(
         return when {
             statusCode == 400 || com.example.data.ai.orchestrator.ConversationSerializer.isRoleCompatibilityErrorMessage(detail) ->
                 AiFailureCategory.INVALID_REQUEST
-            statusCode == 429 || lower.contains("rate limit") || lower.contains("too many requests") ->
+            statusCode == 429 || lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("too many requests") ->
                 AiFailureCategory.RATE_LIMIT_429
             statusCode == 402 || lower.contains("credit") || lower.contains("quota") ->
                 AiFailureCategory.PAYMENT_OR_QUOTA

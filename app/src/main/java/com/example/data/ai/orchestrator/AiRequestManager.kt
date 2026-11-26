@@ -46,6 +46,7 @@ class AiRequestManager(
         pendingApprovalsSummary: String? = null,
         userPreferencesSummary: String? = null,
         requiresWebGrounding: Boolean = false,
+        isRetry: Boolean = false,
         toolExecutor: (suspend (name: String, args: Map<String, JsonElement>) -> AlloraAiService.ToolExecOutput)? = null,
         onStatusPhase: (AiStatusPhase, String) -> Unit = { _, _ -> },
         onStreamTextDelta: (String) -> Unit = {},
@@ -73,7 +74,7 @@ class AiRequestManager(
         return orchestrator.executeTurn(
             snapshot = TurnContextSnapshot(
                 requestId = "req_${UUID.randomUUID().toString().replace("-", "").take(12)}",
-                userId = userId,
+                userId = resolveEffectiveUserId(userId),
                 systemPrompt = systemPrompt,
                 historyPairs = historyPairs,
                 userPrompt = userPrompt,
@@ -93,6 +94,7 @@ class AiRequestManager(
             maxTokens = maxTokens,
             stream = true,
             structuredJsonExpected = structuredJsonExpected,
+            isRetry = isRetry,
             toolExecutor = toolExecutor,
             onStatusPhase = onStatusPhase,
             onStreamTextDelta = onStreamTextDelta,
@@ -113,7 +115,7 @@ class AiRequestManager(
         return orchestrator.executeTurn(
             snapshot = TurnContextSnapshot(
                 requestId = "json_${UUID.randomUUID().toString().replace("-", "").take(12)}",
-                userId = userId,
+                userId = resolveEffectiveUserId(userId),
                 systemPrompt = systemPrompt,
                 historyPairs = emptyList(),
                 userPrompt = prompt
@@ -146,7 +148,7 @@ class AiRequestManager(
         return orchestrator.executeTurn(
             snapshot = TurnContextSnapshot(
                 requestId = "vis_${UUID.randomUUID().toString().replace("-", "").take(12)}",
-                userId = userId,
+                userId = resolveEffectiveUserId(userId),
                 systemPrompt = systemPrompt,
                 historyPairs = emptyList(),
                 userPrompt = userPrompt,
@@ -171,7 +173,7 @@ class AiRequestManager(
         return orchestrator.executeTurn(
             snapshot = TurnContextSnapshot(
                 requestId = "aud_${UUID.randomUUID().toString().replace("-", "").take(12)}",
-                userId = userId,
+                userId = resolveEffectiveUserId(userId),
                 systemPrompt = "",
                 historyPairs = emptyList(),
                 userPrompt = prompt,
@@ -219,7 +221,7 @@ class AiRequestManager(
         return orchestrator.executeTurn(
             snapshot = TurnContextSnapshot(
                 requestId = "live_${UUID.randomUUID().toString().replace("-", "").take(12)}",
-                userId = userId,
+                userId = resolveEffectiveUserId(userId),
                 systemPrompt = systemPrompt,
                 historyPairs = historyPairs,
                 userPrompt = userPrompt
@@ -254,10 +256,18 @@ class AiRequestManager(
 
     fun configureRuntimeHooks(
         networkCheck: (() -> Boolean)? = null,
-        authValidator: (suspend (String) -> Unit)? = null
+        authValidator: (suspend (String) -> Unit)? = null,
+        userIdProvider: (() -> String)? = null
     ) {
-        orchestrator.configureRuntimeHooks(networkCheck = networkCheck, authValidator = authValidator)
+        orchestrator.configureRuntimeHooks(
+            networkCheck = networkCheck,
+            authValidator = authValidator,
+            userIdProvider = userIdProvider
+        )
     }
+
+    fun resolveEffectiveUserId(candidateUserId: String = ""): String =
+        orchestrator.resolveEffectiveUserId(candidateUserId)
 
     fun updateUserPreferences(prefs: AiUserPreferences) {
         orchestrator.updateUserPreferences(prefs)
@@ -294,19 +304,36 @@ class AiRequestManager(
         fun createDefault(
             openRouterClient: OpenRouterClient = OpenRouterClient()
         ): AiRequestManager {
+            val buildProxyUrl = runCatching { com.example.BuildConfig.GROQ_PROXY_URL }
+                .getOrDefault("")
+                .trim()
+                .takeIf { it.isNotBlank() && !it.startsWith("YOUR_") }
+            val buildGroqKey = runCatching { com.example.BuildConfig.GROQ_API_KEY }
+                .getOrDefault("")
+                .trim()
+                .takeIf { it.isNotBlank() && !it.startsWith("YOUR_") }
+
             val orchestrator = AiModelOrchestrator(
                 adapters = AiModelOrchestrator.defaultAdapters(
                     openRouterClient = openRouterClient,
-                    openAiKeyResolver = {
-                        runCatching { com.example.BuildConfig.OPENAI_API_KEY }
-                            .getOrDefault("")
-                            .takeIf { it.isNotBlank() && it != "YOUR_OPENAI_API_KEY" }
-                            .orEmpty()
-                    }
+                    openAiKeyResolver = { buildGroqKey.orEmpty() },
+                    openAiEndpointResolver = { cfg ->
+                        val remoteUrl = cfg.endpointUrl?.trim()
+                            ?.takeIf {
+                                it.isNotBlank() &&
+                                    !it.startsWith("https://api.groq.com") &&
+                                    !it.startsWith("https://api.openai.com")
+                            }
+                        remoteUrl ?: buildProxyUrl ?: cfg.endpointUrl
+                    },
+                    openAiFirebaseIdTokenResolver = null
                 )
             )
             runCatching {
-                Log.d(TAG, "Initialized central AiRequestManager with ${orchestrator.registry.getAllModels().size} seeded models")
+                Log.d(
+                    TAG,
+                    "Initialized central AiRequestManager with ${orchestrator.registry.getAllModels().size} seeded models; groqKeyConfigured=${buildGroqKey != null}; groqProxyConfigured=${buildProxyUrl != null}"
+                )
             }
             return AiRequestManager(orchestrator)
         }

@@ -75,16 +75,33 @@ class AiModelOrchestrator(
     @Volatile
     private var runtimeAuthValidator: (suspend (String) -> Unit)? = null
 
+    @Volatile
+    private var runtimeUserIdProvider: (() -> String)? = null
+
     init {
         healthMonitor.ensureInitializedFor(registry.getAllModels())
     }
 
     fun configureRuntimeHooks(
         networkCheck: (() -> Boolean)? = null,
-        authValidator: (suspend (String) -> Unit)? = null
+        authValidator: (suspend (String) -> Unit)? = null,
+        userIdProvider: (() -> String)? = null
     ) {
         runtimeNetworkCheck = networkCheck
         runtimeAuthValidator = authValidator
+        runtimeUserIdProvider = userIdProvider
+    }
+
+    fun resolveEffectiveUserId(candidateUserId: String): String {
+        val trimmed = candidateUserId.trim()
+        if (trimmed.isNotBlank() && trimmed != "default") {
+            return trimmed
+        }
+        val runtimeUid = runtimeUserIdProvider?.invoke()?.trim()?.takeIf { it.isNotBlank() }
+        if (runtimeUid != null) {
+            return runtimeUid
+        }
+        return trimmed.ifBlank { "default" }
     }
 
     fun updateUserPreferences(prefs: AiUserPreferences) {
@@ -129,12 +146,19 @@ class AiModelOrchestrator(
         stream: Boolean = true,
         structuredJsonExpected: Boolean = false,
         maxToolRounds: Int = DEFAULT_MAX_TOOL_ROUNDS,
+        isRetry: Boolean = false,
         toolExecutor: (suspend (name: String, args: Map<String, JsonElement>) -> AlloraAiService.ToolExecOutput)? = null,
         onStatusPhase: (AiStatusPhase, String) -> Unit = { _, _ -> },
         onStreamTextDelta: (String) -> Unit = {},
         onAttemptReset: () -> Unit = {}
     ): OrchestratedTurnResult {
         val turnStartMs = clockMs()
+        val effectiveUserId = resolveEffectiveUserId(snapshot.userId)
+        AiPipelineDiagnostics.logStage(
+            requestId = snapshot.requestId,
+            stage = "ORCH_START",
+            message = "profile=${taskProfile.name} isRetry=$isRetry hasUid=${effectiveUserId.isNotBlank() && effectiveUserId != "default"} history=${snapshot.historyPairs.size} tools=${tools.size} bitmaps=${snapshot.attachedBitmaps.size}"
+        )
         if (snapshot.userPrompt.isBlank() && snapshot.attachedBitmaps.isEmpty() && snapshot.audioWavBytes == null) {
             throw AiProviderException(
                 category = AiFailureCategory.INVALID_REQUEST,
@@ -145,14 +169,31 @@ class AiModelOrchestrator(
             )
         }
 
+        if (isRetry) {
+            healthMonitor.resetCooldownsForExplicitRetry()
+            AiPipelineDiagnostics.logStage(
+                requestId = snapshot.requestId,
+                stage = "ORCH_RETRY_RESET",
+                message = "Moved OPEN circuits to HALF_OPEN probe state for explicit user retry"
+            )
+        }
+
         val activeAuthValidator = runtimeAuthValidator ?: authTokenValidator
-        if (activeAuthValidator != null) {
+        val authStatusLabel = if (activeAuthValidator != null) {
             try {
-                activeAuthValidator.invoke(snapshot.userId)
+                activeAuthValidator.invoke(effectiveUserId)
+                AiPipelineDiagnostics.logStage(snapshot.requestId, "AUTH_CHECK", "Firebase ID token session valid")
+                "FirebaseSessionValid"
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
                 val mapped = AiFailureClassifier.toProviderException(t, AiProviderType.FIREBASE_AI, "auth_gate")
+                AiPipelineDiagnostics.logStage(
+                    requestId = snapshot.requestId,
+                    stage = "AUTH_CHECK_FAIL",
+                    message = "category=${mapped.category} detail=${mapped.message}",
+                    isError = true
+                )
                 val authOrNetEx = if (mapped.category == AiFailureCategory.NETWORK_ERROR ||
                     mapped.category == AiFailureCategory.TIMEOUT
                 ) {
@@ -171,10 +212,13 @@ class AiModelOrchestrator(
                 emitPhase(AiStatusPhase.UNAVAILABLE, onStatusPhase)
                 throw authOrNetEx
             }
+        } else {
+            "AuthValidatorNotAttached"
         }
 
         val activeNetworkCheck = runtimeNetworkCheck ?: isNetworkAvailable
         if (!activeNetworkCheck.invoke()) {
+            AiPipelineDiagnostics.logStage(snapshot.requestId, "NETWORK_CHECK_FAIL", "Device reported offline", isError = true)
             emitPhase(AiStatusPhase.UNAVAILABLE, onStatusPhase)
             throw AiProviderException(
                 category = AiFailureCategory.NETWORK_ERROR,
@@ -184,7 +228,7 @@ class AiModelOrchestrator(
             )
         }
 
-        usageLimiter.checkAndConsumeRequest(snapshot.userId)
+        usageLimiter.checkAndConsumeRequest(effectiveUserId)
 
         emitPhase(AiStatusPhase.UNDERSTANDING, onStatusPhase)
 
@@ -200,6 +244,11 @@ class AiModelOrchestrator(
             estimatedPromptTokens = estimatedTokens,
             userPreferences = prefs,
             nowMs = clockMs()
+        )
+        AiPipelineDiagnostics.logStage(
+            requestId = snapshot.requestId,
+            stage = "ROUTING_PLAN",
+            message = "mode=${prefs.selectionMode} candidates=${plan.orderedCandidates.joinToString(",") { "${it.modelId}(${it.providerType})" }} skipped=${plan.skippedModels.joinToString("; ").ifBlank { "none" }}"
         )
 
         if (plan.manualModeBlockedReason != null) {
@@ -217,6 +266,18 @@ class AiModelOrchestrator(
         val candidates = plan.orderedCandidates.take(MAX_FAILOVER_MODELS)
         if (candidates.isEmpty()) {
             emitPhase(AiStatusPhase.UNAVAILABLE, onStatusPhase)
+            if (plan.skippedModels.any {
+                    it.contains("GROQ_API_KEY", ignoreCase = true) ||
+                        it.contains("OPENAI_API_KEY", ignoreCase = true)
+                }
+            ) {
+                throw AiProviderException(
+                    category = AiFailureCategory.AUTH_OR_KEY_ERROR,
+                    statusCode = 401,
+                    providerId = AiProviderType.OPENAI_COMPATIBLE.name,
+                    message = "Groq API key (GROQ_API_KEY) is not configured. Add GROQ_API_KEY in the AI Studio Secrets panel and tap Retry."
+                )
+            }
             throw AiProviderException(
                 category = AiFailureCategory.MODEL_NOT_FOUND,
                 providerId = "ORCHESTRATOR",
@@ -231,10 +292,12 @@ class AiModelOrchestrator(
         var createdTripId: String? = null
 
         val attemptedModels = mutableListOf<String>()
+        val attemptTraces = mutableListOf<AiPipelineDiagnostics.AttemptTrace>()
         val failoverEvents = mutableListOf<AiFailoverEvent>()
         var totalFailoverDelayMs = 0L
         var totalToolDurationMs = 0L
         var lastError: AiProviderException? = null
+        var primaryError: AiProviderException? = null
 
         // Mutable conversation & browser/tool context carried across failover attempts so progress is never lost
         val workingMessages = buildInitialMessages(snapshot).toMutableList()
@@ -497,7 +560,7 @@ class AiModelOrchestrator(
                         ttftMs = firstTtftMs
                     )
                     usageLimiter.recordTokenUsage(
-                        userId = snapshot.userId,
+                        userId = effectiveUserId,
                         totalTokens = (promptTokensSum + completionTokensSum).toLong()
                     )
 
@@ -524,7 +587,12 @@ class AiModelOrchestrator(
                         timestampMs = clockMs()
                     )
                     _latestDiagnostics.value = diagnostics
-                    telemetrySink?.onRequestCompleted(snapshot.userId, diagnostics)
+                    telemetrySink?.onRequestCompleted(effectiveUserId, diagnostics)
+                    AiPipelineDiagnostics.logStage(
+                        requestId = snapshot.requestId,
+                        stage = "ORCH_SUCCESS",
+                        message = "selected=${candidate.modelId} provider=${candidate.providerType} failovers=${failoverEvents.size} ttftMs=$firstTtftMs latencyMs=${diagnostics.totalLatencyMs}"
+                    )
                     emitPhase(AiStatusPhase.IDLE, onStatusPhase)
 
                     return OrchestratedTurnResult(
@@ -539,8 +607,37 @@ class AiModelOrchestrator(
                 } catch (ce: CancellationException) {
                     if (ce is TimeoutCancellationException) {
                         val timeoutEx = AiFailureClassifier.toProviderException(ce, candidate.providerType, candidate.modelId)
+                        if (primaryError == null) primaryError = timeoutEx
                         val nextCandidate = candidates.getOrNull(candidateIndex + 1)
                         val shouldRetrySingle = candidates.size == 1 && !singleCandidateRetried && activeNetworkCheck.invoke()
+                        val decision = when {
+                            shouldRetrySingle -> "RetrySameModel"
+                            timeoutEx.category.shouldTriggerFailover && nextCandidate != null -> "FailoverTo:${nextCandidate.modelId}"
+                            else -> "StopNoMoreCandidates"
+                        }
+                        attemptTraces.add(
+                            AiPipelineDiagnostics.AttemptTrace(
+                                candidateIndex = candidateIndex,
+                                modelId = candidate.modelId,
+                                displayName = candidate.displayName,
+                                providerType = candidate.providerType,
+                                providerModelName = candidate.providerModelName,
+                                initStatus = "Executed",
+                                authStatus = authStatusLabel,
+                                appCheckStatus = "NotChecked",
+                                httpStatusCode = timeoutEx.statusCode,
+                                errorCategory = timeoutEx.category,
+                                failoverDecision = decision,
+                                sanitizedDetail = timeoutEx.message,
+                                succeeded = false
+                            )
+                        )
+                        AiPipelineDiagnostics.logStage(
+                            requestId = snapshot.requestId,
+                            stage = "ATTEMPT_TIMEOUT",
+                            message = "candidate=${candidate.modelId} decision=$decision detail=${timeoutEx.message}",
+                            isError = true
+                        )
                         if (shouldRetrySingle) {
                             singleCandidateRetried = true
                             val delayMs = computeBackoffMs(0, timeoutEx)
@@ -552,7 +649,7 @@ class AiModelOrchestrator(
                         healthMonitor.recordFailure(candidate, timeoutEx, triggeredFailover = canFailover)
                         lastError = timeoutEx
                         if (!canFailover) break
-                        val event = recordFailover(candidate, nextCandidate!!, timeoutEx, taskProfile, snapshot.userId, candidateIndex)
+                        val event = recordFailover(candidate, nextCandidate!!, timeoutEx, taskProfile, effectiveUserId, candidateIndex)
                         failoverEvents.add(event)
                         totalFailoverDelayMs += event.delayMs
                         if (event.delayMs > 0L) sleepFn(event.delayMs)
@@ -563,11 +660,13 @@ class AiModelOrchestrator(
                     }
                 } catch (t: Throwable) {
                     val providerEx = AiFailureClassifier.toProviderException(t, candidate.providerType, candidate.modelId)
-                    runCatching {
-                        android.util.Log.w(
-                            "AiModelOrchestrator",
-                            "Candidate ${candidate.modelId} (${candidate.providerType}) failed category=${providerEx.category} status=${providerEx.statusCode}: ${AiFailureClassifier.sanitizeDetail(providerEx.message, 120)}"
-                        )
+                    if (primaryError == null) primaryError = providerEx
+                    val appCheckDiag = if (candidate.providerType == AiProviderType.FIREBASE_AI &&
+                        providerEx.category == AiFailureCategory.AUTH_OR_KEY_ERROR
+                    ) {
+                        probeAppCheckStatus()
+                    } else {
+                        "NotApplicable"
                     }
                     if (providerEx.category == AiFailureCategory.INVALID_REQUEST) {
                         repairWorkingMessagesInPlace(workingMessages)
@@ -579,6 +678,36 @@ class AiModelOrchestrator(
                         (providerEx.category == AiFailureCategory.SERVER_ERROR_5XX ||
                             providerEx.category == AiFailureCategory.STREAM_INTERRUPTED ||
                             providerEx.category == AiFailureCategory.TIMEOUT)
+                    val canFailover = providerEx.category.shouldTriggerFailover && nextCandidate != null
+                    val decision = when {
+                        shouldRetrySingle -> "RetrySameModel"
+                        canFailover -> "FailoverTo:${nextCandidate!!.modelId}"
+                        !providerEx.category.shouldTriggerFailover -> "AbortNonRetryable:${providerEx.category}"
+                        else -> "StopNoMoreCandidates"
+                    }
+                    attemptTraces.add(
+                        AiPipelineDiagnostics.AttemptTrace(
+                            candidateIndex = candidateIndex,
+                            modelId = candidate.modelId,
+                            displayName = candidate.displayName,
+                            providerType = candidate.providerType,
+                            providerModelName = candidate.providerModelName,
+                            initStatus = "Executed",
+                            authStatus = authStatusLabel,
+                            appCheckStatus = appCheckDiag,
+                            httpStatusCode = providerEx.statusCode,
+                            errorCategory = providerEx.category,
+                            failoverDecision = decision,
+                            sanitizedDetail = providerEx.message,
+                            succeeded = false
+                        )
+                    )
+                    AiPipelineDiagnostics.logStage(
+                        requestId = snapshot.requestId,
+                        stage = "ATTEMPT_FAIL",
+                        message = "candidate=${candidate.modelId} provider=${candidate.providerType} auth=$authStatusLabel appCheck=$appCheckDiag cat=${providerEx.category} http=${providerEx.statusCode} decision=$decision cause=${providerEx.message}",
+                        isError = true
+                    )
                     if (shouldRetrySingle) {
                         singleCandidateRetried = true
                         val delayMs = computeBackoffMs(0, providerEx)
@@ -586,7 +715,6 @@ class AiModelOrchestrator(
                         if (delayMs > 0L) sleepFn(delayMs)
                         continue
                     }
-                    val canFailover = providerEx.category.shouldTriggerFailover && nextCandidate != null
                     healthMonitor.recordFailure(candidate, providerEx, triggeredFailover = canFailover)
                     lastError = providerEx
 
@@ -594,7 +722,7 @@ class AiModelOrchestrator(
                         break
                     }
 
-                    val event = recordFailover(candidate, nextCandidate!!, providerEx, taskProfile, snapshot.userId, candidateIndex)
+                    val event = recordFailover(candidate, nextCandidate!!, providerEx, taskProfile, effectiveUserId, candidateIndex)
                     failoverEvents.add(event)
                     totalFailoverDelayMs += event.delayMs
                     if (event.delayMs > 0L) sleepFn(event.delayMs)
@@ -606,10 +734,71 @@ class AiModelOrchestrator(
             }
         }
 
-        val finalEx = lastError ?: AiProviderException(
-            category = AiFailureCategory.UNKNOWN,
-            providerId = "ORCHESTRATOR",
-            message = "All compatible AI models are temporarily unavailable."
+        val failureTrail = AiPipelineDiagnostics.buildFailureTrailSummary(attemptTraces, plan.skippedModels)
+        val finalEx = when {
+            lastError == null -> AiProviderException(
+                category = AiFailureCategory.UNKNOWN,
+                providerId = "ORCHESTRATOR",
+                message = failureTrail.ifBlank { "All compatible AI models are temporarily unavailable." }
+            )
+            attemptTraces.count { !it.succeeded } <= 1 -> {
+                val backupSkipNote = plan.skippedModels
+                    .firstOrNull {
+                        it.contains("Groq", ignoreCase = true) ||
+                            it.contains("OpenAI", ignoreCase = true)
+                    }
+                    ?.let { " | $it" }
+                    .orEmpty()
+                if (backupSkipNote.isNotBlank()) {
+                    AiProviderException(
+                        category = lastError.category,
+                        statusCode = lastError.statusCode,
+                        retryAfterMs = lastError.retryAfterMs,
+                        retryable = lastError.retryable,
+                        providerId = lastError.providerId,
+                        modelId = lastError.modelId,
+                        message = AiFailureClassifier.sanitizeDetail("${lastError.message}$backupSkipNote", 260),
+                        cause = lastError.cause ?: lastError
+                    )
+                } else {
+                    lastError
+                }
+            }
+            attemptTraces.filter { !it.succeeded }.all { it.errorCategory == AiFailureCategory.SERVER_ERROR_5XX } -> {
+                AiProviderException(
+                    category = AiFailureCategory.SERVER_ERROR_5XX,
+                    statusCode = 503,
+                    retryable = true,
+                    providerId = "ORCHESTRATOR",
+                    modelId = lastError.modelId,
+                    message = failureTrail.ifBlank { lastError.message },
+                    cause = lastError.cause ?: lastError
+                )
+            }
+            else -> {
+                val preferredEx = primaryError?.takeIf {
+                    lastError.category == AiFailureCategory.PAYMENT_OR_QUOTA ||
+                        lastError.category == AiFailureCategory.MODEL_NOT_FOUND
+                } ?: primaryError?.takeIf {
+                    it.category == AiFailureCategory.AUTH_OR_KEY_ERROR
+                } ?: lastError
+                AiProviderException(
+                    category = preferredEx.category,
+                    statusCode = preferredEx.statusCode,
+                    retryAfterMs = preferredEx.retryAfterMs,
+                    retryable = preferredEx.retryable,
+                    providerId = preferredEx.providerId,
+                    modelId = preferredEx.modelId,
+                    message = failureTrail.ifBlank { preferredEx.message },
+                    cause = preferredEx.cause ?: preferredEx
+                )
+            }
+        }
+        AiPipelineDiagnostics.logStage(
+            requestId = snapshot.requestId,
+            stage = "ORCH_FINAL_FAIL",
+            message = "category=${finalEx.category} status=${finalEx.statusCode} model=${finalEx.modelId} summary=${finalEx.message}",
+            isError = true
         )
         val failDiagnostics = AiRequestDiagnostics(
             requestId = snapshot.requestId,
@@ -628,9 +817,23 @@ class AiModelOrchestrator(
             timestampMs = clockMs()
         )
         _latestDiagnostics.value = failDiagnostics
-        telemetrySink?.onRequestCompleted(snapshot.userId, failDiagnostics)
+        telemetrySink?.onRequestCompleted(effectiveUserId, failDiagnostics)
         emitPhase(AiStatusPhase.UNAVAILABLE, onStatusPhase)
         throw finalEx
+    }
+
+    private fun probeAppCheckStatus(): String {
+        return runCatching {
+            val task = com.google.firebase.appcheck.FirebaseAppCheck.getInstance().getAppCheckToken(false)
+            val result = com.google.android.gms.tasks.Tasks.await(
+                task,
+                1_500L,
+                java.util.concurrent.TimeUnit.MILLISECONDS
+            )
+            if (!result?.token.isNullOrBlank()) "AppCheckTokenAvailable" else "AppCheckTokenEmpty"
+        }.getOrElse { err ->
+            "AppCheckError(${AiFailureClassifier.sanitizeExceptionChain(err, 90)})"
+        }
     }
 
     private suspend fun executeSingleAdapterCall(
@@ -684,7 +887,10 @@ class AiModelOrchestrator(
 
     private fun buildInitialMessages(snapshot: TurnContextSnapshot): List<UnifiedMessage> {
         val out = mutableListOf<UnifiedMessage>()
-        ConversationSerializer.normalizeHistoryPairs(snapshot.historyPairs, maxEntries = 10)
+        ConversationSerializer.normalizeHistoryPairs(
+            snapshot.historyPairs,
+            maxEntries = com.example.data.ai.GroqSettings.MAX_HISTORY_MESSAGES
+        )
             .forEach { (isUser, msg) ->
                 out.add(UnifiedMessage(role = if (isUser) "user" else "assistant", text = msg))
             }
@@ -740,16 +946,22 @@ class AiModelOrchestrator(
 
     companion object {
         private const val MAX_FAILOVER_MODELS = 5
-        private const val DEFAULT_MAX_TOOL_ROUNDS = 5
+        private const val DEFAULT_MAX_TOOL_ROUNDS = com.example.data.ai.GroqSettings.MAX_TOOL_STEPS
 
         fun defaultAdapters(
             openRouterClient: OpenRouterClient = OpenRouterClient(),
             openAiKeyResolver: (String) -> String = { "" },
-            anthropicKeyResolver: (String) -> String = { "" }
+            anthropicKeyResolver: (String) -> String = { "" },
+            openAiEndpointResolver: ((AiModelConfig) -> String?)? = null,
+            openAiFirebaseIdTokenResolver: (suspend () -> String?)? = null
         ): Map<AiProviderType, AiProviderAdapter> = mapOf(
             AiProviderType.FIREBASE_AI to FirebaseAiProviderAdapter(),
             AiProviderType.OPENROUTER to OpenRouterProviderAdapter(openRouterClient),
-            AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(openAiKeyResolver),
+            AiProviderType.OPENAI_COMPATIBLE to OpenAiCompatibleProviderAdapter(
+                apiKeyResolver = openAiKeyResolver,
+                endpointResolver = openAiEndpointResolver,
+                firebaseIdTokenResolver = openAiFirebaseIdTokenResolver
+            ),
             AiProviderType.ANTHROPIC_COMPATIBLE to AnthropicCompatibleProviderAdapter(anthropicKeyResolver)
         )
     }

@@ -285,7 +285,11 @@ object SharedToolCatalog {
             OpenRouterToolSpec(
                 name = TOOL_NOTIFICATIONS_PERMISSIONS,
                 description = "Checks unread workspace notifications, permission levels, revoked domains, and Kill Switch status.",
-                parametersSchema = OpenRouterSchemas.obj(properties = emptyMap())
+                parametersSchema = OpenRouterSchemas.obj(
+                    properties = mapOf(
+                        "include_revoked" to OpenRouterSchemas.bool("Whether to include revoked domain details (default true)")
+                    )
+                )
             ),
             OpenRouterToolSpec(
                 name = TOOL_RUN_AUTONOMOUS_TASK,

@@ -2,6 +2,7 @@ package com.example.agent
 
 import com.example.agent.tools.ResearchSynthesizer
 import com.example.data.ai.FirebaseAiChatBackend
+import com.example.data.ai.GroqSettings
 import com.example.data.ai.OpenRouterClient
 import com.example.data.ai.OpenRouterSchemas
 import com.example.data.ai.orchestrator.AiRequestManager
@@ -28,7 +29,7 @@ interface TaskPlannerAiBackend : ResearchSynthesizer {
 }
 
 class FirebaseTaskPlannerBackend(
-    private val modelId: String = FirebaseAiChatBackend.DEFAULT_GEMINI_MODEL,
+    private val modelId: String = GroqSettings.MAIN_MODEL,
     private val aiRequestManager: AiRequestManager = AiRequestManager.getInstance()
 ) : TaskPlannerAiBackend {
 

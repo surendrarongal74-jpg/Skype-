@@ -195,9 +195,7 @@ class AlloraAiChatPipelineTest {
         cloudRepo: FakeCloudRepository = FakeCloudRepository(),
         geminiBackend: ScriptedGeminiBackend = ScriptedGeminiBackend(),
         clearLocalStore: Boolean = true,
-        aiRequestManager: AiRequestManager? = null,
-        authTokenValidator: (suspend (String) -> Unit)? = null,
-        onVerifySessionRequested: (() -> Unit)? = null
+        aiRequestManager: AiRequestManager? = null
     ): QuadHarness {
         val context = ApplicationProvider.getApplicationContext<Context>()
         if (FirebaseApp.getApps(context).isEmpty()) {
@@ -220,8 +218,7 @@ class AlloraAiChatPipelineTest {
             openRouterClient = openRouter,
             geminiBackend = geminiBackend,
             aiRequestManager = aiRequestManager,
-            userIdProvider = { uid },
-            authTokenValidator = authTokenValidator
+            userIdProvider = { uid }
         )
         val store = androidx.lifecycle.ViewModelStore()
         val vm = androidx.lifecycle.ViewModelProvider(
@@ -239,7 +236,6 @@ class AlloraAiChatPipelineTest {
                         currentUserId = uid,
                         initialDisplayName = "Sam",
                         chatLocalStore = localStore,
-                        onVerifySessionRequested = onVerifySessionRequested,
                         aiRequestManager = aiRequestManager ?: AiRequestManager.getInstance()
                     ) as T
                 }
@@ -777,40 +773,6 @@ class AlloraAiChatPipelineTest {
             collectorJob.cancel()
             harness.cleanup()
             server.shutdown()
-        }
-    }
-
-    @Test
-    fun `expired Firebase auth renders AUTHENTICATION_FAILURE pill with Sign in again action and blocks provider call`() {
-        var reauthClicked = false
-        val harness = buildTestHarness(
-            authTokenValidator = {
-                throw IllegalStateException("Firebase ID token expired. Please sign in again.")
-            },
-            onVerifySessionRequested = { reauthClicked = true }
-        )
-        try {
-            composeRule.setContent {
-                AlloraTheme(darkTheme = false) {
-                    AlloraChatScreen(viewModel = harness.vm, onBack = {}, onNavigateSub = {})
-                }
-            }
-
-            composeRule.onNodeWithTag("composer_text_input").performTextInput("Check my account")
-            composeRule.onNodeWithTag("composer_send_button").performClick()
-            awaitChatSettled(harness.vm)
-
-            assertEquals(0, harness.backend.recordedCalls.size)
-            assertEquals(AiChatState.ERROR, harness.vm.aiChatState.value)
-            assertEquals(AlloraChatInterfaceState.AUTHENTICATION_FAILURE, harness.vm.chatInterfaceState.value)
-            assertFalse(harness.vm.chatTypingState.value)
-
-            composeRule.onNodeWithTag("chat_ai_status_pill").assertIsDisplayed()
-            composeRule.onNodeWithText("Authentication failure").assertIsDisplayed()
-            composeRule.onNodeWithTag("chat_reauth_action_button").assertIsDisplayed().performClick()
-            assertTrue(reauthClicked)
-        } finally {
-            harness.cleanup()
         }
     }
 

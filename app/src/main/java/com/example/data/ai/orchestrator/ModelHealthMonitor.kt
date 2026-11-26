@@ -155,6 +155,28 @@ class ModelHealthMonitor(
         publishSnapshots()
     }
 
+    /**
+     * When the user explicitly taps Retry, transition OPEN circuits to HALF_OPEN probes
+     * and clear cooldown locks so recovered providers can be re-tested immediately.
+     */
+    fun resetCooldownsForExplicitRetry() {
+        val now = clockMs()
+        statsByModel.keys.forEach { id ->
+            statsByModel.computeIfPresent(id) { _, cur ->
+                if (cur.circuitState == CircuitState.OPEN || cur.cooldownUntilMs > now) {
+                    cur.copy(
+                        circuitState = CircuitState.HALF_OPEN,
+                        cooldownUntilMs = 0L,
+                        lastUpdatedMs = now
+                    )
+                } else {
+                    cur
+                }
+            }
+        }
+        publishSnapshots()
+    }
+
     private fun computeCooldownMs(exception: AiProviderException, consecutiveFailures: Int): Long {
         if (exception.retryAfterMs != null && exception.retryAfterMs > 0L) {
             return exception.retryAfterMs.coerceIn(5_000L, MAX_COOLDOWN_MS)

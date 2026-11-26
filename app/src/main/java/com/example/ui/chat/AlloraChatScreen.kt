@@ -304,8 +304,7 @@ fun AlloraChatScreen(
             onEmailDelete = { emailId -> viewModel.stageDeleteConfirmationInChat(emailId) },
             onExplainWalletTx = { txId -> viewModel.explainWalletTxInChat(txId) },
             chatInterfaceState = chatInterfaceState,
-            isRetryingMessage = isRetryingMessage,
-            onVerifySessionRequested = { viewModel.requestSessionReverification() }
+            isRetryingMessage = isRetryingMessage
         )
     }
 }
@@ -362,8 +361,7 @@ fun AlloraChatContent(
     onEmailDelete: (String) -> Unit = {},
     onExplainWalletTx: (String) -> Unit = {},
     chatInterfaceState: AlloraChatInterfaceState = AlloraChatInterfaceState.IDLE,
-    isRetryingMessage: Boolean = false,
-    onVerifySessionRequested: () -> Unit = {}
+    isRetryingMessage: Boolean = false
 ) {
     val c = LocalAlloraChatColors.current
     val context = LocalContext.current
@@ -736,13 +734,22 @@ fun AlloraChatContent(
                                     }
                                 }
                                 val retryThisMessage: () -> Unit = {
-                                    if (!isRetryingMessage) {
+                                    val isInFlight = isRetryingMessage ||
+                                        chatInterfaceState == AlloraChatInterfaceState.SENDING ||
+                                        chatInterfaceState == AlloraChatInterfaceState.THINKING ||
+                                        chatInterfaceState == AlloraChatInterfaceState.RECEIVING_RESPONSE
+                                    if (!isInFlight) {
                                         val failedId = when (entry) {
                                             is ChatListEntry.AssistantBlockRow -> entry.message.id
                                             is ChatListEntry.AssistantStreamingRow -> entry.message.id
                                             is ChatListEntry.UserRow -> entry.message.id
                                             is ChatListEntry.DateDivider -> ""
                                         }
+                                        com.example.data.ai.orchestrator.AiPipelineDiagnostics.logStage(
+                                            requestId = failedId.ifBlank { "ui_retry" },
+                                            stage = "UI_RETRY_TAP",
+                                            message = "hasOnRetry=${onRetryMessage != null}"
+                                        )
                                         if (onRetryMessage != null && failedId.isNotBlank()) {
                                             onRetryMessage(failedId)
                                         } else {
@@ -1047,24 +1054,6 @@ fun AlloraChatContent(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                                if (chatInterfaceState == AlloraChatInterfaceState.AUTHENTICATION_FAILURE) {
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(50))
-                                            .background(c.accentBlue.copy(alpha = 0.14f))
-                                            .clickable(onClick = onVerifySessionRequested)
-                                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                                            .testTag("chat_reauth_action_button")
-                                    ) {
-                                        Text(
-                                            text = "Sign in again",
-                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                color = c.accentBlue,
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                        )
-                                    }
-                                }
                             }
                         }
                         if (showBrowserPill) {
